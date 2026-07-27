@@ -16,7 +16,8 @@ what you reach from a browser or a phone.
 
 ## Requirements
 
-- Node.js 18 or newer, and npm
+- **Node.js 22.12 or newer**, and npm. Electron 41 requires it — on an older
+  Node, `npm install` fails in Electron's postinstall with `ERR_REQUIRE_ESM`.
 - Go 1.25.3 or newer — only to build the sidecar binary
 - A checkout of [`rysh-cli-code`](https://github.com/rysh-ai/rysh-cli-code) as a
   sibling directory, for the same reason
@@ -37,6 +38,9 @@ rysh-cli-parent/
 npm install
 make dev            # builds the sidecar for your platform, then opens the app
 ```
+
+Only after the web renderer, not the desktop app? That part needs no Electron
+binary, so `npm ci --ignore-scripts` is enough and any Node 18+ will do.
 
 `make dev` runs `electron-vite dev`: hot reload on the renderer, and the app
 talks to a real `rysh` daemon it spawned itself. To run it detached from your
