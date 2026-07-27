@@ -1,0 +1,135 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", "SF Mono",
+               "Menlo", "Monaco", "Consolas", monospace;
+  font-size: 13px;
+  line-height: 1.4;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+/* Make selected text clearly visible on the dark theme (VS Code selection
+   color). Without an explicit rule the default highlight is hard to see, which
+   made copy feel broken even when a selection was active. */
+::selection {
+  background: #264f78;
+  color: inherit;
+}
+
+.pane-output {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 2px 10px;
+  word-wrap: break-word;
+  white-space: pre-wrap;
+  font-size: 13px;
+  cursor: text;
+  scrollbar-width: thin;
+  scrollbar-color: #444 transparent;
+}
+.pane-output::-webkit-scrollbar { width: 6px; }
+.pane-output::-webkit-scrollbar-track { background: transparent; }
+.pane-output::-webkit-scrollbar-thumb { background: #444; border-radius: 3px; }
+
+.ansi-bold { font-weight: bold; }
+.ansi-dim { opacity: 0.7; }
+.ansi-italic { font-style: italic; }
+.ansi-underline { text-decoration: underline; }
+.ansi-strikethrough { text-decoration: line-through; }
+
+.vt-screen {
+  flex: 1;
+  overflow: hidden;
+  padding: 2px 4px;
+  font-size: 13px;
+  line-height: 1.2;
+  white-space: pre;
+  background: #1e1e1e;
+  /* Allow selecting text out of interactive (raw-mode) programs for copy. */
+  user-select: text;
+  cursor: text;
+}
+.vt-line {
+  height: 1.2em;
+  overflow: hidden;
+}
+.vt-cursor {
+  background: #d4d4d4;
+  color: #1e1e1e;
+}
+
+/* Electron-specific: frameless window drag region */
+.titlebar-drag-region {
+  -webkit-app-region: drag;
+}
+.titlebar-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* Web pane placeholder */
+.web-pane-container {
+  flex: 1;
+  /* min-height:0 lets the flex:1 page area shrink to fit instead of growing to
+     content size — without it the container overflows the pane, and the native
+     WebContentsView (positioned at the page area's rect, and NOT clipped by the
+     pane's overflow-hidden / rounded border) spills past the pane edges. */
+  min-height: 0;
+  overflow: hidden;
+  position: relative;
+  background: #252525;
+  display: flex;
+  flex-direction: column;
+}
+.web-pane-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  background: #2a2a2a;
+  border-bottom: 1px solid #333;
+  font-size: 12px;
+}
+.web-pane-toolbar button {
+  background: #333;
+  border: 1px solid #444;
+  color: #aaa;
+  border-radius: 3px;
+  padding: 1px 6px;
+  cursor: pointer;
+  font-size: 11px;
+}
+.web-pane-toolbar button:hover {
+  background: #444;
+  color: #ddd;
+}
+.web-pane-toolbar button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.web-pane-url-bar {
+  flex: 1;
+  background: #1e1e1e;
+  border: 1px solid #444;
+  border-radius: 3px;
+  padding: 2px 8px;
+  color: #d4d4d4;
+  font-family: inherit;
+  font-size: 12px;
+  outline: none;
+}
+.web-pane-url-bar:focus {
+  border-color: #00d7d7;
+}

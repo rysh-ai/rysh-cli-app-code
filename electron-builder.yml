@@ -1,0 +1,66 @@
+appId: com.rysh.desktop
+productName: Rysh
+copyright: Copyright © 2024-2026 Rysh
+
+directories:
+  buildResources: resources
+  output: release
+
+extraResources:
+  - from: sidecar/
+    to: sidecar/
+    filter:
+      - "**/*"
+
+files:
+  - dist/**/*
+  - "!node_modules/**/*"
+
+mac:
+  category: public.app-category.developer-tools
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+    - target: zip
+      arch:
+        - arm64
+        - x64
+  darkModeSupport: true
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: resources/entitlements.mac.plist
+  entitlementsInherit: resources/entitlements.mac.plist
+  extendInfo:
+    NSMicrophoneUsageDescription: Rysh uses the microphone for voice prompting (speech-to-text).
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+
+linux:
+  category: Development
+  # Required by the .deb (fpm) target as the package maintainer.
+  maintainer: Rysh <info@rysh.ai>
+  target:
+    # x64 only: CI builds a linux/amd64 Go sidecar, so an arm64 AppImage would
+    # ship a wrong-arch binary. rpm is omitted (needs rpmbuild on the runner).
+    - target: AppImage
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+
+publish:
+  provider: github
+  owner: rysh
+  repo: rysh-cli-app

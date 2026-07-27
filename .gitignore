@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+release/
+
+# Sidecar binaries (built per-platform, not checked in)
+sidecar/rysh-*
+
+# Environment / secrets
+.env
+.env.*
+.electron-builder.env
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TypeScript
+*.tsbuildinfo
+
+# Rysh runtime/session state (NATS JetStream, sessions, secrets KV) — never commit
+.rysh/
