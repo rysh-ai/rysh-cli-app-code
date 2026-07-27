@@ -134,7 +134,7 @@ build-sidecar-local:
 	elif [ "$$GOOS" = "windows" ]; then \
 		SUFFIX="win-x64.exe"; \
 	fi && \
-	cd $(GO_CLI_SRC) && GOWORK=off go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-$$SUFFIX . && \
+	cd $(GO_CLI_SRC) && GOWORK=off go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-$$SUFFIX ./cmd/rysh && \
 	echo "Built: $(SIDECAR_DIR)/rysh-$$SUFFIX"
 
 # Build sidecar for all platforms (for distribution)
@@ -142,11 +142,11 @@ build-sidecar:
 	@mkdir -p $(SIDECAR_DIR)
 	@echo "Cross-compiling rysh sidecar for all platforms..."
 	cd $(GO_CLI_SRC) && \
-	GOWORK=off GOOS=darwin  GOARCH=arm64 go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-darwin-arm64 . && \
-	GOWORK=off GOOS=darwin  GOARCH=amd64 go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-darwin-x64   . && \
-	GOWORK=off GOOS=linux   GOARCH=amd64 go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-linux-x64    . && \
-	GOWORK=off GOOS=linux   GOARCH=arm64 go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-linux-arm64  . && \
-	GOWORK=off GOOS=windows GOARCH=amd64 go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-win-x64.exe  .
+	GOWORK=off GOOS=darwin  GOARCH=arm64 go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-darwin-arm64 ./cmd/rysh && \
+	GOWORK=off GOOS=darwin  GOARCH=amd64 go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-darwin-x64   ./cmd/rysh && \
+	GOWORK=off GOOS=linux   GOARCH=amd64 go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-linux-x64    ./cmd/rysh && \
+	GOWORK=off GOOS=linux   GOARCH=arm64 go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-linux-arm64  ./cmd/rysh && \
+	GOWORK=off GOOS=windows GOARCH=amd64 go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-win-x64.exe  ./cmd/rysh
 	@echo "All sidecar binaries built."
 
 # ── Packaging ──

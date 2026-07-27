@@ -30,7 +30,7 @@ for target in "${TARGETS[@]}"; do
   IFS=':' read -r goos goarch suffix <<< "$target"
   output="$SIDECAR_DIR/rysh-$suffix"
   echo "  Building: GOOS=$goos GOARCH=$goarch → $output"
-  (cd "$GO_SRC" && GOWORK=off GOOS="$goos" GOARCH="$goarch" go build -o "$output" .)
+  (cd "$GO_SRC" && GOWORK=off GOOS="$goos" GOARCH="$goarch" go build -o "$output" ./cmd/rysh)
 done
 
 echo ""
