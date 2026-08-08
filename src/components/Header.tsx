@@ -39,6 +39,7 @@ export function Header() {
   const showSharePanel = useStore((s) => s.showSharePanel);
   const showDashboard = useStore((s) => s.showDashboard);
   const workspaceName = useStore((s) => s.workspaceName);
+  const webEnv = useStore((s) => s.webEnv);
   const workspaces = useStore((s) => s.snapshot?.workspaces);
   const activeWorkspace = useStore((s) => s.snapshot?.active_workspace ?? 0);
   const [gridOpen, setGridOpen] = useState(false);
@@ -154,6 +155,19 @@ export function Header() {
         ) : (
           <span className="text-[11px] font-medium text-[#d4d4d4] shrink-0 whitespace-nowrap">
             {wsSingleName}
+          </span>
+        )}
+        {/* Web-mode badge (roadmap W9): running in a browser against the rysh
+            web server. The genuinely-native desktop controls (reload app,
+            restart daemon, detach) don't exist here — this note is the visible
+            affordance replacing them, so nothing degrades silently. */}
+        {!window.electronAPI && webEnv?.isWeb && (
+          <span
+            title={`Connected to rysh session "${webEnv.sessionName}" on ${webEnv.platform} via the browser. Desktop-only controls (reload app, restart daemon, detach session, native folder picker) are available in the Rysh desktop app.`}
+            className="ml-1 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider bg-[#1f3a3a] text-[#6fd7d7] shrink-0 cursor-help select-none"
+            style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+          >
+            web
           </span>
         )}
         {/* Draggable filler so the rest of the row moves the window. */}

@@ -1,0 +1,15 @@
+<!--
+  macOS menu-bar glyph — the template image. Pure black on transparent: macOS
+  recolours template images itself (light bar, dark bar, and the inverted state
+  while the menu is open), so any colour here would defeat that.
+
+  Same mark as icon.svg, without the app shape — a rounded square at 16pt reads
+  as a smudge — and scaled up to fill the 32-unit box, since the background is
+  gone and the glyph has to carry the whole icon.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <g fill="none" stroke="#000000" stroke-width="4.16" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4.8 8.4 L12.8 15.6 L4.8 22.8"/>
+    <path d="M16.8 22.8 H27.2"/>
+  </g>
+</svg>

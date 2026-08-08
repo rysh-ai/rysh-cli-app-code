@@ -1,6 +1,6 @@
 {
   "name": "rysh-cli-app",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "description": "Rysh Desktop — Agentic terminal multiplexer with embedded web panes",
   "main": "dist/electron/main.js",
@@ -11,8 +11,10 @@
     "preview": "electron-vite preview",
     "package": "electron-builder",
     "make:mac": "electron-builder --mac",
-    "make:win": "electron-builder --win",
     "make:linux": "electron-builder --linux",
+    "icons": "./scripts/gen-icons.sh",
+    "test": "vitest",
+    "test:run": "vitest run",
     "typecheck:main": "tsc --noEmit -p tsconfig.main.json",
     "typecheck:renderer": "tsc --noEmit -p tsconfig.renderer.json",
     "typecheck": "npm run typecheck:main && npm run typecheck:renderer"
@@ -27,6 +29,9 @@
   "devDependencies": {
     "@electron-toolkit/preload": "^3.0.1",
     "@electron-toolkit/utils": "^3.0.0",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.2",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
@@ -34,12 +39,19 @@
     "electron": "^41.10.1",
     "electron-builder": "^25.1.8",
     "electron-vite": "^2.3.0",
+    "jsdom": "^30.0.1",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
     "typescript": "~5.6.3",
-    "vite": "^5.4.14"
+    "vite": "^5.4.14",
+    "vitest": "^2.1.9"
   },
   "build": {
     "extends": "electron-builder.yml"
+  },
+  "allowScripts": {
+    "electron@41.10.1": true,
+    "esbuild@0.21.5": true,
+    "fsevents@2.3.3": true
   }
 }

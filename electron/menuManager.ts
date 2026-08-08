@@ -1,6 +1,7 @@
-import { app, Menu, BrowserWindow, Tray, nativeImage, shell } from 'electron'
+import { app, Menu, BrowserWindow, Tray, nativeImage, shell, dialog } from 'electron'
 import { join } from 'path'
 import { is } from '@electron-toolkit/utils'
+import { getSidecarVersion } from './sidecar'
 import type { WorkspaceInfo } from './workspaceManager'
 
 export interface MenuManagerOptions {
@@ -39,8 +40,23 @@ export class NativeMenuManager {
    * Set up the application menu and system tray.
    */
   setup(): void {
+    this.setupAboutPanel()
     this.setupAppMenu()
     this.setupTray()
+  }
+
+  /**
+   * Fill in the native macOS About panel (the `about` role in the app menu),
+   * so it reports the same two versions as Help → About Rysh. Costs one ~12ms
+   * `rysh --version` spawn, cached thereafter.
+   */
+  private setupAboutPanel(): void {
+    app.setAboutPanelOptions({
+      applicationName: 'Rysh',
+      applicationVersion: app.getVersion(),
+      version: `rysh ${getSidecarVersion()}`,
+      copyright: 'Copyright © 2024-2026 Rysh',
+    })
   }
 
   /**
@@ -235,21 +251,42 @@ export class NativeMenuManager {
             },
           },
           {
+            // Not a github.com/... link: rysh-cli-app is a private repo, so its
+            // issue tracker 404s for everyone who downloaded the app. Mail is
+            // the support channel published on rysh.ai.
             label: 'Report Issue',
             click: (): void => {
-              shell.openExternal('https://github.com/rysh-ai/rysh-cli-app-code/issues')
+              const body = [
+                '',
+                '---',
+                `Rysh Desktop: v${app.getVersion()}`,
+                `rysh CLI:     ${getSidecarVersion()}`,
+                `Platform:     ${process.platform} ${process.arch}`,
+                `Electron:     ${process.versions.electron}`,
+              ].join('\n')
+              shell.openExternal(
+                'mailto:support@rysh.ai' +
+                  '?subject=' +
+                  encodeURIComponent(`Rysh Desktop v${app.getVersion()} — issue report`) +
+                  '&body=' +
+                  encodeURIComponent(body)
+              )
             },
           },
           { type: 'separator' },
           {
             label: 'About Rysh',
             click: (): void => {
-              const { dialog } = require('electron')
               dialog.showMessageBox(this.window, {
                 type: 'info',
                 title: 'About Rysh',
                 message: `Rysh Desktop v${app.getVersion()}`,
-                detail: 'Agentic terminal multiplexer with embedded web panes.',
+                detail:
+                  'Agentic terminal multiplexer with embedded web panes.\n\n' +
+                  // The desktop app and the bundled CLI version independently,
+                  // so a report naming only one of them is ambiguous.
+                  `Bundled rysh: ${getSidecarVersion()}\n` +
+                  `Electron ${process.versions.electron} · ${process.platform}-${process.arch}`,
               })
             },
           },
@@ -265,10 +302,15 @@ export class NativeMenuManager {
    * Set up the system tray icon and context menu.
    */
   private setupTray(): void {
-    // Create tray icon
+    // macOS gets the template image, which the system recolours for the light
+    // bar, the dark bar, and the inverted state while the menu is open. Linux
+    // panels do no recolouring and are usually dark, so a black glyph would be
+    // invisible there — it gets the brand-coloured one instead.
+    const iconName =
+      process.platform === 'darwin' ? 'tray-iconTemplate.png' : 'tray-icon.png'
     const iconPath = is.dev
-      ? join(app.getAppPath(), 'resources', 'tray-icon.png')
-      : join(process.resourcesPath, 'tray-icon.png')
+      ? join(app.getAppPath(), 'resources', iconName)
+      : join(process.resourcesPath, iconName)
 
     // Use a fallback 16x16 empty image if the icon file doesn't exist
     let trayIcon: Electron.NativeImage
@@ -281,9 +323,12 @@ export class NativeMenuManager {
       trayIcon = nativeImage.createEmpty()
     }
 
-    // Resize for tray (16x16 on most platforms)
-    if (!trayIcon.isEmpty()) {
-      trayIcon = trayIcon.resize({ width: 16, height: 16 })
+    // Deliberately NOT resized. createFromPath picks up the @2x file alongside
+    // it, so the image already carries both representations at the right size;
+    // resizing collapses that to a single 16x16 bitmap and the icon turns to
+    // mush on every Retina display.
+    if (!trayIcon.isEmpty() && process.platform === 'darwin') {
+      trayIcon.setTemplateImage(true)
     }
 
     this.tray = new Tray(trayIcon)

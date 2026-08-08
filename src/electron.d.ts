@@ -59,7 +59,9 @@ interface ElectronAPI {
     getRecent: () => Promise<WorkspaceInfo[]>
     open: () => Promise<void>
     select: (path: string) => Promise<{ success: boolean; error?: string }>
-    onChanged: (callback: (info: { path: string; name: string; port: number }) => void) => void
+    onChanged: (
+      callback: (info: { path: string; name: string; port: number }) => void
+    ) => void
     removeChangedListener: () => void
   }
 

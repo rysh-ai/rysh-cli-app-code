@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { useStore, findPane } from '../store';
+import { sendCommand } from '../utils/commands';
 import { BrowserAgentChat } from './BrowserAgentChat';
 
 interface Props {
@@ -142,16 +143,11 @@ export const WebPaneView = React.memo(function WebPaneView({ paneId }: Props) {
   }, [paneId, isElectron]);
 
   if (!isElectron) {
-    return (
-      <div className="flex-1 flex items-center justify-center text-[#666] p-5 text-center">
-        <div>
-          <div className="text-lg mb-2">Web panes require the Rysh desktop app</div>
-          <div className="text-sm text-[#555]">
-            Use <code className="bg-[#333] px-1 rounded">##web &lt;url&gt;</code> in the desktop app to embed websites in panes.
-          </div>
-        </div>
-      </div>
-    );
+    // Browser mode (roadmap W12): a plain tab cannot embed third-party pages
+    // (X-Frame-Options / CSP), so the rysh server drives a headless browser
+    // and streams frames — or, when that capability is missing, this pane
+    // shows an explicit note instead of silently breaking.
+    return <ServerWebPaneView paneId={paneId} webUrl={webUrl} webProfile={webProfile} />;
   }
 
   return (
@@ -236,3 +232,137 @@ export const WebPaneView = React.memo(function WebPaneView({ paneId }: Props) {
     </div>
   );
 });
+
+/**
+ * ServerWebPaneView — browser-mode web pane (web_electron_roadmap W12).
+ *
+ * The rysh web server drives a headless server-side Chromium for this pane
+ * (ws commands webpane_open/navigate/back/forward/reload) and streams JPEG
+ * frames + url/title back as `webpane_frame`. When the server lacks the
+ * capability (no Chromium / no workspace — /api/env capabilities.web_pane
+ * false) or reports an error, that state is shown explicitly: the capability
+ * degrades visibly, never silently.
+ */
+function ServerWebPaneView({
+  paneId,
+  webUrl,
+  webProfile,
+}: {
+  paneId: string;
+  webUrl: string;
+  webProfile: string;
+}) {
+  const available = useStore((s) => s.webEnv?.capabilities.webPane === true);
+  const envKnown = useStore((s) => s.webEnv !== null);
+  const frame = useStore((s) => s.webPaneFrames[paneId]);
+  const error = useStore((s) => s.webPaneErrors[paneId]);
+  const connected = useStore((s) => s.connected);
+
+  const [urlText, setUrlText] = useState('');
+  const urlFocusedRef = useRef(false);
+  useEffect(() => {
+    if (!urlFocusedRef.current) setUrlText(frame?.url || webUrl || '');
+  }, [frame?.url, webUrl]);
+
+  // Open (or re-attach) the server-side browser whenever the binding is known.
+  // webpane_open is idempotent per pane+profile server-side, so remounts from
+  // input-mode cycling just re-sync instead of relaunching.
+  useEffect(() => {
+    if (!available || !connected || !webProfile) return;
+    sendCommand('webpane_open', {
+      pane_id: paneId,
+      url: webUrl || 'about:blank',
+      profile: webProfile,
+    });
+  }, [available, connected, paneId, webUrl, webProfile]);
+
+  const navigate = useCallback(
+    (url: string) => sendCommand('webpane_navigate', { pane_id: paneId, url }),
+    [paneId]
+  );
+
+  if (!available) {
+    return (
+      <div className="flex-1 flex items-center justify-center text-[#666] p-5 text-center">
+        <div>
+          <div className="text-lg mb-2">Web panes require the Rysh desktop app</div>
+          <div className="text-sm text-[#555]">
+            {envKnown
+              ? 'This rysh server cannot drive a server-side browser (no Chromium available), so embedded pages are desktop-only here.'
+              : 'This rysh server does not offer server-side web panes.'}{' '}
+            Use <code className="bg-[#333] px-1 rounded">##web &lt;url&gt;</code> in the desktop app to embed websites in panes.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="web-pane-container">
+      {/* Navigation toolbar — same gestures as the desktop pane, executed by
+          the server-side browser. */}
+      <div className="web-pane-toolbar">
+        <button onClick={() => sendCommand('webpane_back', { pane_id: paneId })} title="Back">
+          &#9664;
+        </button>
+        <button onClick={() => sendCommand('webpane_forward', { pane_id: paneId })} title="Forward">
+          &#9654;
+        </button>
+        <button onClick={() => sendCommand('webpane_reload', { pane_id: paneId })} title="Reload">
+          &#8635;
+        </button>
+        <span
+          className="whitespace-nowrap text-[9px] uppercase tracking-wider text-[#5fafaf] select-none"
+          title="This page runs in a server-side browser; the pane shows a live view (~1 frame/s)."
+        >
+          server view
+        </span>
+        <input
+          type="text"
+          className="web-pane-url-bar"
+          value={urlText}
+          placeholder="Enter URL..."
+          onChange={(e) => setUrlText(e.target.value)}
+          onFocus={() => { urlFocusedRef.current = true; }}
+          onBlur={() => { urlFocusedRef.current = false; setUrlText(frame?.url || webUrl || ''); }}
+          onKeyDown={(e) => {
+            e.stopPropagation();
+            if (e.key === 'Enter') {
+              const url = urlText.trim();
+              if (url) {
+                const fullUrl = /^[a-z]+:\/\//i.test(url) || url.startsWith('about:')
+                  ? url
+                  : `https://${url}`;
+                navigate(fullUrl);
+                (e.target as HTMLInputElement).blur();
+              }
+            }
+          }}
+        />
+      </div>
+
+      {/* Frame area: latest server-side screenshot, or the current state. */}
+      <div className="flex-1 min-h-0 overflow-auto bg-[#101010] flex items-start justify-center">
+        {error ? (
+          <div className="p-5 text-center text-[13px] text-[#ff8787] max-w-[560px]">{error}</div>
+        ) : frame?.screenshot ? (
+          <img
+            src={`data:image/jpeg;base64,${frame.screenshot}`}
+            alt={frame.title || 'server-side web pane'}
+            className="max-w-full h-auto"
+            draggable={false}
+          />
+        ) : (
+          <div className="p-5 text-[13px] text-[#666]">starting server-side browser…</div>
+        )}
+      </div>
+
+      {/* Title bar */}
+      {frame?.title && (
+        <div className="px-2 py-0.5 text-[#808080] text-[11px] border-t border-[#333] bg-[#1a1a1a] truncate">
+          {frame.title}
+        </div>
+      )}
+    </div>
+  );
+}

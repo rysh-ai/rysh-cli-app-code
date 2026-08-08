@@ -3,9 +3,39 @@ import { useStore } from '../store';
 /**
  * Send a command to the Go server via WebSocket.
  */
+// Focus-moving commands, by action name. Issuing any of them is a NEWER
+// statement of where the user wants focus, so it supersedes a pending click
+// override — see clearing rules in store.setSnapshot.
+//
+// focus_pane_by_id is absent on purpose: that IS the click, and PaneBox sets
+// the override alongside it (and re-sends it after 2.5s).
+const FOCUS_MOVING_ACTIONS = new Set([
+  'focus_pane_left',
+  'focus_pane_right',
+  'focus_pane_up',
+  'focus_pane_down',
+  'focus_next_pane',
+  'focus_prev_pane',
+  'focus_next_tab',
+  'focus_prev_tab',
+  'focus_tab_index',
+  'stacked_pane_next',
+  'stacked_pane_prev',
+  'stacked_pane_select',
+  'swap_pane',
+]);
+
 export function sendCommand(action: string, params?: Record<string, unknown>): void {
   const ws = useStore.getState().ws;
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  // Keyboard navigation and stack rotation move focus deliberately. Drop any
+  // pending click override here rather than inferring it from the snapshot:
+  // the store can no longer tell "the daemon moved focus for its own reasons"
+  // (a pane being created, which must NOT cancel a click) from "the user asked
+  // for a different pane" (which must).
+  if (FOCUS_MOVING_ACTIONS.has(action) && useStore.getState().activePaneOverride) {
+    useStore.getState().setActivePaneOverride(null);
+  }
   ws.send(
     JSON.stringify({
       type: 'command',

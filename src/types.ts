@@ -327,3 +327,56 @@ export interface WebPaneStatus {
   canGoForward: boolean;
   loading: boolean;
 }
+
+// WebEnv is the server-reported environment for the WEB (browser) build,
+// fetched from GET /api/env (web_electron_roadmap W9). It replaces
+// feature-sniffing: the UI shows/hides capabilities from this, so features
+// either work or are visibly absent — never silently broken.
+export interface WebEnv {
+  isWeb: boolean;
+  platform: string;
+  sessionName: string;
+  control: boolean;
+  workspace: { path: string; name: string };
+  capabilities: {
+    completion: boolean;
+    workspaces: boolean;
+    voice: boolean;
+    webPane: boolean; // server-side embedded browser available (W12)
+    restartDaemon: boolean; // always false in web mode
+    nativeOpen: boolean; // always false in web mode
+  };
+}
+
+// WebPaneFrame is one server-side web-pane frame (roadmap W12): the current
+// url/title plus a base64 JPEG screenshot streamed over /ws.
+export interface WebPaneFrame {
+  paneId: string;
+  url: string;
+  title: string;
+  screenshot: string; // base64 JPEG
+}
+
+/**
+ * One pane's content in a seed batch (server: internal/web/seed.go paneSeed).
+ * Field names match the snapshot's pane JSON so the same assignment applies.
+ */
+export interface PaneSeed {
+  pane_id: string;
+  output?: string;
+  ai_output?: string;
+  rysh_output?: string;
+  chat_output?: string;
+  external_output?: string;
+  mode_outputs?: Record<string, string>;
+  shell_history?: string[];
+  prompt_history?: string[];
+  raw_mode?: boolean;
+  vt_screen?: string[];
+  vt_cursor_row?: number;
+  vt_cursor_col?: number;
+  remote_interactive?: boolean;
+  remote_vt_screen?: string[];
+  remote_vt_cursor_row?: number;
+  remote_vt_cursor_col?: number;
+}

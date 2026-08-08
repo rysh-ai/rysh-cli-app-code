@@ -1,6 +1,6 @@
 import { dialog, BrowserWindow } from 'electron'
-import { listAppSessions, type AppSession } from './sessionStore'
-import { DaemonRegistry } from './daemonRegistry'
+import { listOpenableSessions, type AppSession } from './sessionStore'
+import { DaemonRegistry, isPidAlive } from './daemonRegistry'
 
 /**
  * The outcome of the native session picker:
@@ -14,41 +14,47 @@ export type SessionChoice =
   | { kind: 'cancel' }
 
 /**
- * Show a native dialog listing the app's sessions for this workspace and let the
- * user pick one, create a new one, or cancel. Only sessions created by the
- * desktop app are listed (the CLI's own sessions are filtered out). When the
- * workspace has no app sessions yet, returns { kind: 'new' } so the caller goes
- * straight to naming a new session.
+ * Show a native dialog listing every session in this workspace and let the user
+ * pick one, create a new one, or cancel. When the workspace has no sessions
+ * yet, returns { kind: 'new' } so the caller goes straight to naming one.
+ *
+ * Command-line sessions used to be filtered out, because the two front-ends
+ * refused to open each other's. They no longer do — the app is a superset of
+ * the terminal's render surfaces, so it opens a terminal session with nothing
+ * lost. Origin is shown as a label instead of a filter.
  */
 export async function pickSession(
   parent: BrowserWindow,
   workspaceRoot: string
 ): Promise<SessionChoice> {
-  const sessions = listAppSessions(workspaceRoot)
+  const sessions = listOpenableSessions(workspaceRoot)
   if (sessions.length === 0) {
     return { kind: 'new' }
   }
 
-  // A session whose daemon this app left running (Detach) is adoptable: opening
-  // it reconnects with full in-memory state. Flag those so the user can tell
-  // them apart from cold sessions (which restore layout + content from KV only).
+  // A session with a live daemon is adoptable: opening it reconnects with full
+  // in-memory state, where a cold session restores layout + content from KV
+  // only. Two ways to be live — a daemon this app left running (the registry)
+  // or any other daemon still holding its recorded PID, which is how a
+  // command-line session shows up here.
   const registry = new DaemonRegistry()
-  const isLive = (name: string): boolean => !!registry.findAlive(workspaceRoot, name)
+  const isLive = (s: AppSession): boolean =>
+    !!registry.findAlive(workspaceRoot, s.name) || (s.pid > 0 && isPidAlive(s.pid))
 
   // Button layout: [session…, "New Session…", "Cancel"]. response is the index
   // into this array regardless of how the OS visually arranges the buttons.
-  const sessionLabels = sessions.map((s) => sessionLabel(s, isLive(s.name)))
+  const sessionLabels = sessions.map((s) => sessionLabel(s, isLive(s)))
   const buttons = [...sessionLabels, 'New Session…', 'Cancel']
 
-  const anyLive = sessions.some((s) => isLive(s.name))
+  const anyLive = sessions.some((s) => isLive(s))
 
   const { response } = await dialog.showMessageBox(parent, {
     type: 'question',
     title: 'Open Rysh Session',
     message: 'Select a session to open',
     detail: anyLive
-      ? 'Only Rysh desktop-app sessions are shown.\n● = running — reattaches with full state.'
-      : 'Only sessions created by the Rysh desktop app are shown.',
+      ? '● = running — reattaches with full state.\n"terminal" marks a session created from the command line.'
+      : '"terminal" marks a session created from the command line.',
     buttons,
     defaultId: 0,
     cancelId: buttons.length - 1,
@@ -65,16 +71,22 @@ export async function pickSession(
 }
 
 /**
- * Human label for a session button, e.g. "work  —  detached".
+ * Human label for a session button, e.g. "work  —  detached (terminal)".
+ *
  * A live (adoptable) daemon is marked with a ● and labelled "running" so the
  * user knows it reattaches with full in-memory state; one that another app
- * window is currently connected to shows "attached (app)" instead, so the
- * user knows opening it here joins a session that is already on screen.
+ * window is currently connected to shows "attached (app)" instead, so the user
+ * knows opening it here joins a session that is already on screen.
+ *
+ * Sessions created from the command line are marked "(terminal)" — not as a
+ * warning (the app renders everything a terminal can, and more) but because
+ * opening one may join a session someone is driving from a shell right now.
  */
 function sessionLabel(s: AppSession, live: boolean): string {
-  if (live && s.appClients > 0) return `● ${s.name}  —  attached (app)`
-  if (live) return `● ${s.name}  —  running`
-  return `${s.name}  —  ${s.state}`
+  const origin = s.source === 'cli' ? ' (terminal)' : ''
+  if (live && s.appClients > 0) return `● ${s.name}  —  attached (app)${origin}`
+  if (live) return `● ${s.name}  —  running${origin}`
+  return `${s.name}  —  ${s.state}${origin}`
 }
 
 /**

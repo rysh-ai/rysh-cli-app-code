@@ -1,6 +1,8 @@
 import { useEffect, useRef } from 'react';
 import { useStore, markWebActivated, markWebDeactivated } from '../store';
 import { sendCommand } from '../utils/commands';
+import { resolveCompletionResult } from '../utils/completion';
+import { wsAuthQuery } from '../utils/auth';
 
 /**
  * Manages the WebSocket lifecycle: connect, receive snapshots/approvals,
@@ -53,12 +55,19 @@ export function useWebSocket() {
 
       let wsUrl: string;
       if (window.electronAPI && sidecarPort) {
-        // Electron mode: connect to sidecar on localhost (content-plane stream).
+        // Electron mode: connect to sidecar on localhost (content-plane
+        // stream). No credential to present: the app's daemons run in control
+        // mode — loopback-only, no login — and that is the only kind it talks
+        // to over this socket.
         wsUrl = `ws://127.0.0.1:${sidecarPort}/ws?stream=1`;
       } else {
         // Browser mode: use page origin (content-plane stream).
+        //
+        // The login JWT lives in localStorage, and a browser cannot set
+        // headers on a WebSocket handshake, so it goes in the query string,
+        // which the server accepts for exactly this reason.
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        wsUrl = `${proto}//${location.host}/ws?stream=1`;
+        wsUrl = `${proto}//${location.host}/ws?stream=1${wsAuthQuery()}`;
       }
 
       const ws = new WebSocket(wsUrl);
@@ -67,6 +76,11 @@ export function useWebSocket() {
         if (unmounted) { ws.close(); return; }
         useStore.getState().setConnected(true);
         useStore.getState().setWs(ws);
+        // A new connection holds no pane size claims on the daemon — the old
+        // ones were released when the previous socket closed. Anything that
+        // reported a size has to report it again, or this window silently
+        // stops constraining the panes it is showing.
+        useStore.getState().bumpWsEpoch();
       };
 
       ws.onmessage = (evt) => {
@@ -76,6 +90,13 @@ export function useWebSocket() {
           switch (msg.type) {
             case 'snapshot':
               store.setSnapshot(msg.data, msg.layout_only);
+              break;
+            // Seed batches: the server used to send one full snapshot, which on a
+            // large workspace could not be written inside the socket's write
+            // deadline over a tunnel and left this UI permanently blank. Content
+            // now arrives as byte-bounded batches after a layout-only snapshot.
+            case 'pane_content':
+              if (Array.isArray(msg.data?.panes)) store.applyPaneContentSeed(msg.data.panes);
               break;
             case 'pane_output': {
               const d = msg.data;
@@ -99,6 +120,30 @@ export function useWebSocket() {
             }
             case 'pane_vt':
               if (msg.data?.pane_id) store.setPaneVT(msg.data.pane_id, msg.data);
+              break;
+            case 'completion_result':
+              // W7: reply to a completion_get this client sent (request/reply
+              // over the same socket; correlated by request_id).
+              resolveCompletionResult(msg.data || {});
+              break;
+            case 'webpane_frame':
+              // W12: a server-driven web pane pushed a fresh frame (url/title +
+              // JPEG screenshot) for browser-mode rendering.
+              if (msg.data?.pane_id) {
+                store.setWebPaneFrame({
+                  paneId: msg.data.pane_id,
+                  url: msg.data.url || '',
+                  title: msg.data.title || '',
+                  screenshot: msg.data.screenshot || '',
+                });
+              }
+              break;
+            case 'webpane_error':
+              // W12 fail-visible: surface server-side web-pane failures in the
+              // pane instead of silently showing nothing.
+              if (msg.data?.pane_id) {
+                store.setWebPaneError(msg.data.pane_id, msg.data.error || 'web pane error');
+              }
               break;
             case 'approval_request':
               store.setPendingApproval(msg.data);
@@ -214,6 +259,11 @@ export function useWebSocket() {
                 markWebDeactivated(msg.data.pane_id);
                 store.clearWebBinding(msg.data.pane_id);
                 store.setInputMode(msg.data.pane_id, 'shell');
+                // W12: in browser mode also tear down the pane's server-side
+                // browser (the Electron path GCs its native view via syncAlive).
+                if (!window.electronAPI) {
+                  sendCommand('webpane_close', { pane_id: msg.data.pane_id });
+                }
               }
               break;
             case 'import_cookies':

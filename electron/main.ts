@@ -154,6 +154,64 @@ function createWindow(): BrowserWindow {
 }
 
 /**
+ * Connect to a session's daemon, preferring to ADOPT a live one over spawning a
+ * new one, and cold-starting only when there is nothing to adopt. Returns true
+ * if a running daemon was adopted.
+ *
+ * Adoption matters because it preserves the daemon's full in-memory state —
+ * running shells, scrollback, agent state — where a cold start restores only
+ * what KV persisted (layout and pane content; live shells are gone).
+ *
+ * Two ways in, tried in order:
+ *
+ *  1. The app's private registry, which holds {pid, webPort} for daemons THIS
+ *     app spawned and later detached from.
+ *  2. The session record on disk, which every daemon maintains regardless of
+ *     which front-end started it. This is what makes a command-line session
+ *     openable here at all: the app never spawned it, so the registry has
+ *     never heard of it, and its daemon may have no web server for the
+ *     renderer to reach — ensureWebEndpoint discovers or opens one.
+ *
+ * Cold-starting is the fallback, but only when there is genuinely no live
+ * daemon. A daemon that is ALIVE yet unreachable throws instead: spawning a
+ * second daemon for the same session name would put two of them on the same
+ * ws.* subjects, which is a worse outcome than a visible failure.
+ */
+async function adoptOrStart(
+  sidecar: SidecarManager,
+  sessionName: string,
+  dirPath: string
+): Promise<boolean> {
+  const known = sidecar.getRegistry().findAlive(dirPath, sessionName)
+  if (known && (await sidecar.adopt(sessionName, dirPath, known.webPort, known.pid))) {
+    return true
+  }
+
+  const found = await sidecar.ensureWebEndpoint(sessionName, dirPath)
+  if (found.kind === 'endpoint') {
+    if (await sidecar.adopt(sessionName, dirPath, found.port, found.pid)) {
+      return true
+    }
+    throw new Error(
+      `session "${sessionName}" has a live daemon (pid ${found.pid}) whose web server ` +
+        `stopped answering — refusing to start a second daemon for it`
+    )
+  }
+  if (found.kind === 'unreachable') {
+    throw new Error(
+      `session "${sessionName}" has a live daemon (pid ${found.pid}) this app cannot reach: ` +
+        `${found.reason}. Open a web server in it (##rysh web start) or stop it first — ` +
+        `starting a second daemon for the same session would collide with the first.`
+    )
+  }
+
+  sidecar.setWorkingDirectory(dirPath)
+  sidecar.setSessionName(sessionName)
+  await sidecar.start()
+  return false
+}
+
+/**
  * Open a workspace by directory path. Validates rysh.config exists,
  * restarts the sidecar with the workspace as CWD, and notifies the renderer.
  */
@@ -205,20 +263,7 @@ async function openWorkspace(
     // Destroy all web panes
     webPaneManager.destroyAll()
 
-    // Prefer ADOPTING a daemon a previous app run left running for this session
-    // (Detach): reconnecting preserves its full in-memory state (running shells,
-    // scrollback, agent state). Fall back to a cold start (KV restores the
-    // persisted layout + pane content; live shells are gone) when none is alive.
-    const alive = sidecarManager.getRegistry().findAlive(dirPath, session)
-    let adopted = false
-    if (alive) {
-      adopted = await sidecarManager.adopt(session, dirPath, alive.webPort, alive.pid)
-    }
-    if (!adopted) {
-      sidecarManager.setWorkingDirectory(dirPath)
-      sidecarManager.setSessionName(session)
-      await sidecarManager.start()
-    }
+    const adopted = await adoptOrStart(sidecarManager, session, dirPath)
     console.log(
       `[main] ${adopted ? 'Adopted running' : 'Cold-started'} daemon on port ` +
         `${sidecarManager.getPort()} for session ${session}`
@@ -562,19 +607,13 @@ app.whenReady().then(async () => {
       // real one); else the folder name for a first-ever open.
       let session = lastWs.lastSession?.trim() || ''
       if (!session) {
-        const appSessions = listSessions(lastWs.path).filter((s) => s.source === 'app')
-        session = appSessions[0]?.name || basename(lastWs.path)
+        // Any session in the workspace, whichever front-end created it — the
+        // app opens command-line sessions too. Still prefer an existing one
+        // over inventing a new name: cold-starting "myproject" next to the
+        // user's real session is the outcome to avoid.
+        session = listSessions(lastWs.path)[0]?.name || basename(lastWs.path)
       }
-      const alive = sidecarManager.getRegistry().findAlive(lastWs.path, session)
-      let adopted = false
-      if (alive) {
-        adopted = await sidecarManager.adopt(session, lastWs.path, alive.webPort, alive.pid)
-      }
-      if (!adopted) {
-        sidecarManager.setWorkingDirectory(lastWs.path)
-        sidecarManager.setSessionName(session)
-        await sidecarManager.start()
-      }
+      const adopted = await adoptOrStart(sidecarManager, session, lastWs.path)
       workspaceManager.setCurrent(lastWs.path)
       workspaceManager.addRecent(lastWs.path, session)
       console.log(

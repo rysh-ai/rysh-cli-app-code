@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useStore, findPane } from '../store';
 import { sendCommand } from '../utils/commands';
 import { voice } from '../utils/voice';
+import { getCompletions, completionAvailable } from '../utils/completion';
 import type { InputMode } from '../types';
 
 interface Props {
@@ -157,8 +158,9 @@ export const PaneInput = React.memo(function PaneInput({
   }
 
   async function handleTab(reverse: boolean) {
-    // Only complete in shell mode in the desktop app.
-    if (pipelineActive || inputMode !== 'shell' || !window.electronAPI?.completion) return;
+    // Only complete in shell mode. Served by the Electron main process in the
+    // desktop app, or by the rysh web server over /ws in browser mode (W7).
+    if (pipelineActive || inputMode !== 'shell' || !completionAvailable()) return;
     const el = inputRef.current;
 
     // A menu is already open: cycle the selection.
@@ -183,21 +185,16 @@ export const PaneInput = React.memo(function PaneInput({
     const suffix = value.slice(cursor);
     const isFirstToken = prefixPart.trim() === '';
 
-    let res: { candidates: { value: string; isDir: boolean }[] } | undefined;
-    try {
-      res = await window.electronAPI.completion.get({
-        shellPid: shellPid || 0,
-        token,
-        isFirstToken,
-        // OSC 7-reported live cwd (exact after every cd) and the full line up
-        // to the cursor for bash programmable completion (git/ssh/docker...).
-        cwd: shellCwd || '',
-        line: before,
-      });
-    } catch {
-      return;
-    }
-    const cands = res?.candidates || [];
+    const cands = await getCompletions({
+      paneId,
+      shellPid: shellPid || 0,
+      token,
+      isFirstToken,
+      // OSC 7-reported live cwd (exact after every cd) and the full line up
+      // to the cursor for bash programmable completion (git/ssh/docker...).
+      cwd: shellCwd || '',
+      line: before,
+    });
     if (cands.length === 0) return;
 
     if (cands.length === 1) {
@@ -277,19 +274,24 @@ export const PaneInput = React.memo(function PaneInput({
   const displayValue = search ? search.match : inputText;
 
   function getHistory(): string[] {
-    const snapshot = useStore.getState().snapshot;
+    const { snapshot, paneHistory: seededHistory } = useStore.getState();
     if (!snapshot) return [];
     for (const tab of snapshot.tabs) {
       for (const lane of tab.lanes || []) {
         for (const g of lane.pane_groups || []) {
           for (const p of g.panes || []) {
             if (p.id === paneId) {
+              // Prefer the seeded history: layout refreshes omit histories on
+              // purpose (a layout snapshot carrying them was 5.8 MB, too large
+              // to write inside the socket deadline over a tunnel), so the
+              // snapshot's copy goes away after the first refresh.
+              const seeded = seededHistory[paneId];
               switch (inputMode) {
-                case 'prompt': return p.prompt_history || [];
+                case 'prompt': return seeded?.prompt?.length ? seeded.prompt : (p.prompt_history || []);
                 case 'rysh': return p.rysh_history || [];
                 case 'chat': return p.chat_history || [];
                 case 'external': return p.external_history || [];
-                default: return p.shell_history || [];
+                default: return seeded?.shell?.length ? seeded.shell : (p.shell_history || []);
               }
             }
           }

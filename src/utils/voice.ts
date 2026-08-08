@@ -1,10 +1,17 @@
 import { useStore } from '../store';
+import { apiFetch } from './auth';
 
 /**
- * Singleton voice controller. Records the microphone via MediaRecorder, sends
- * the audio to the Electron main process for transcription (Deepgram/Whisper —
- * done in main to avoid browser CORS and keep the API key out of the renderer),
- * and drops the transcript into the active pane's input field.
+ * Singleton voice controller. Records the microphone via MediaRecorder,
+ * transcribes it out-of-renderer (Deepgram/Whisper — the API key never lives
+ * in the page), and drops the transcript into the active pane's input field.
+ *
+ * Two transcription backends, same behavior (web_electron_roadmap W10):
+ *   - Electron: window.electronAPI.voice.transcribe (main process).
+ *   - Web mode: POST /api/voice/transcribe on the page origin — the rysh web
+ *     server runs the identical Go provider call (internal/voice) server-side.
+ *     Availability is advertised by /api/env; when voice is not configured the
+ *     mic button simply does not render (voiceConfig.enabled stays false).
  *
  * Mirrors the rysh-cli TUI voice feature (3f3d182): voice only POPULATES the
  * input; the user reviews and submits with Enter.
@@ -51,9 +58,16 @@ function pickMimeType(): string | undefined {
   return undefined;
 }
 
+// transcriberAvailable: an Electron voice bridge, or a web server that
+// advertised voice capability via /api/env (W10).
+function transcriberAvailable(): boolean {
+  if (window.electronAPI?.voice) return true;
+  return useStore.getState().webEnv?.capabilities.voice === true;
+}
+
 async function start(): Promise<void> {
-  if (!window.electronAPI?.voice) {
-    setState('error', 'voice: only available in the desktop app');
+  if (!transcriberAvailable()) {
+    setState('error', 'voice: not configured on this rysh server');
     return;
   }
   if (
@@ -115,12 +129,27 @@ async function finalize(): Promise<void> {
   setState('transcribing');
   try {
     const buf = await blob.arrayBuffer();
+    let res: { transcript?: string; error?: string };
     const api = window.electronAPI?.voice;
-    if (!api) {
+    if (api) {
+      // Electron path stays primary when present.
+      res = await api.transcribe(buf, type);
+    } else if (transcriberAvailable()) {
+      // Web mode: same-origin server-side transcription (apiFetch carries the
+      // access-token cookie and the login bearer token; the provider key stays
+      // on the server).
+      const resp = await apiFetch('/api/voice/transcribe', {
+        method: 'POST',
+        headers: { 'Content-Type': type },
+        body: buf,
+      });
+      res = resp.ok
+        ? ((await resp.json()) as { transcript?: string; error?: string })
+        : { error: `voice: server replied ${resp.status}` };
+    } else {
       setState('error', 'voice: bridge unavailable');
       return;
     }
-    const res = await api.transcribe(buf, type);
     if (res.error) {
       setState('error', res.error);
       return;
@@ -155,8 +184,9 @@ export const voice = {
     if (st === 'transcribing') return; // busy
     void start();
   },
-  /** True when running in the desktop app with voice enabled in config. */
+  /** True when a transcriber is reachable (Electron bridge or the web
+   *  server's /api/voice) AND voice is enabled in config. */
   isAvailable(): boolean {
-    return !!window.electronAPI?.voice && useStore.getState().voiceConfig?.enabled === true;
+    return transcriberAvailable() && useStore.getState().voiceConfig?.enabled === true;
   },
 };

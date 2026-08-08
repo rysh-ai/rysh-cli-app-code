@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { WorkspaceSnapshot, PaneSnapshot, PendingApproval, AppMode, InputMode, WebPaneStatus, AgentInfo, HumanoidInfo, ShareInfo, EmailSummary, EmailDetail, WhatsAppMsgSummary, WhatsAppMsgDetail, PairingState, PairingQR, PairingStatusInfo, DashboardTab, PendingPair } from './types';
+import type { WorkspaceSnapshot, PaneSnapshot, PaneSeed, PendingApproval, AppMode, InputMode, WebPaneStatus, WebEnv, WebPaneFrame, AgentInfo, HumanoidInfo, ShareInfo, EmailSummary, EmailDetail, WhatsAppMsgSummary, WhatsAppMsgDetail, PairingState, PairingQR, PairingStatusInfo, DashboardTab, PendingPair } from './types';
 import { FIXED_INPUT_MODES } from './types';
 
 // Tracks the last-seen web_profile per pane so setSnapshot can auto-activate web
@@ -156,6 +156,8 @@ interface AppStore {
   panePendingCmd: Record<string, string>;
   fullscreenPaneID: string | null;
   activePaneOverride: string | null;
+  /** When the pending override was set (ms). Bounds how long an unacked click holds the UI. */
+  activePaneOverrideAt: number;
   escCount: number;
   escTimer: ReturnType<typeof setTimeout> | null;
   renameText: string;
@@ -176,6 +178,18 @@ interface AppStore {
   // browser blank). WebPaneView prefers this and falls back to the snapshot only
   // for restore-on-startup (when no push happened this session).
   webBindings: Record<string, { profile: string; url: string }>;
+
+  // --- Web (browser) mode: server-reported environment (roadmap W9) ---
+  // Fetched once from GET /api/env when running without electronAPI. This is
+  // the authoritative "I am the web build" signal plus what the server can do
+  // (completion / voice / server-side web panes), replacing feature-sniffing.
+  // null = Electron, or /api/env not (yet) answered.
+  webEnv: WebEnv | null;
+
+  // Server-side web-pane stream (roadmap W12): latest frame + visible error
+  // per pane, pushed by the server over /ws as webpane_frame / webpane_error.
+  webPaneFrames: Record<string, WebPaneFrame>;
+  webPaneErrors: Record<string, string>;
 
   // Agent / Humanoid / Share panel data
   agentList: AgentInfo[];
@@ -262,6 +276,15 @@ interface AppStore {
 
   // Electron state
   sidecarPort: number | null;
+  /**
+   * Increments on every WebSocket open. Panes report their size to the daemon
+   * as a per-connection CLAIM (the daemon sizes a pane's PTY to the smallest
+   * viewport showing it), and a reconnect is a NEW connection holding no
+   * claims — so anything that reported a size has to report it again. Watching
+   * this is how usePaneResize knows to re-send a size it would otherwise
+   * suppress as unchanged.
+   */
+  wsEpoch: number;
 
   // Workspace state
   workspacePath: string | null;
@@ -335,17 +358,38 @@ interface AppStore {
   backspaceEcho: (paneId: string) => void;
   clearEcho: (paneId: string) => void;
   appendPaneOutput: (paneId: string, mode: string, text: string) => void;
+  /** Apply one seed batch of per-pane content (see server internal/web/seed.go). */
+  applyPaneContentSeed: (panes: PaneSeed[]) => void;
+  /**
+   * Command history per pane, from the seed. Held here rather than read off the
+   * snapshot because layout refreshes deliberately omit histories — a
+   * layout-only snapshot carrying them measured 5.8 MB, which cannot be written
+   * inside the socket deadline over a tunnel.
+   */
+  paneHistory: Record<string, { shell: string[]; prompt: string[] }>;
   setPaneVT: (paneId: string, vt: PaneVTBuf) => void;
   setWebPaneStatus: (status: WebPaneStatus) => void;
+  setWebEnv: (env: WebEnv | null) => void;
+  setWebPaneFrame: (frame: WebPaneFrame) => void;
+  setWebPaneError: (paneId: string, error: string) => void;
   setWebBinding: (paneId: string, profile: string, url: string) => void;
   clearWebBinding: (paneId: string) => void;
   setVoiceConfig: (c: { enabled: boolean; provider: string; hotkey: string; language: string } | null) => void;
   setVoiceState: (s: 'idle' | 'recording' | 'transcribing' | 'error') => void;
   setVoiceError: (e: string | null) => void;
   setSidecarPort: (port: number) => void;
+  bumpWsEpoch: () => void;
   setWorkspace: (path: string | null, name: string | null) => void;
   getEffectiveActivePaneID: () => string;
 }
+
+// A click override is a bet that the daemon will confirm the focus command we
+// just sent. PaneBox re-sends at 2.5s; this is the backstop for the case where
+// the command is never acted on at all (daemon busy, command dropped), so the
+// UI cannot wedge on a pane the daemon does not agree is focused.
+//
+// Comfortably longer than the re-send so a slow-but-working ack still wins.
+const ACTIVE_PANE_OVERRIDE_TTL_MS = 6000;
 
 export const useStore = create<AppStore>((set, get) => ({
   // Initial state
@@ -363,6 +407,8 @@ export const useStore = create<AppStore>((set, get) => ({
   panePendingCmd: {},
   fullscreenPaneID: null,
   activePaneOverride: null,
+  activePaneOverrideAt: 0,
+  paneHistory: {},
   escCount: 0,
   escTimer: null,
   renameText: '',
@@ -372,6 +418,9 @@ export const useStore = create<AppStore>((set, get) => ({
   showSharePanel: false,
   webPaneStatuses: {},
   webBindings: {},
+  webEnv: null,
+  webPaneFrames: {},
+  webPaneErrors: {},
   agentList: [],
   humanoidList: [],
   controlEnabled: false,
@@ -404,13 +453,13 @@ export const useStore = create<AppStore>((set, get) => ({
   voiceState: 'idle',
   voiceError: null,
   sidecarPort: null,
+  wsEpoch: 0,
   workspacePath: null,
   workspaceName: null,
 
   // Actions
   setSnapshot: (s, layoutOnly) => {
-    const { activePaneOverride, paneEcho, paneContent: prevContent, paneVT: prevVT, paneInputModes, snapshot: prevSnapshot } = get();
-    const prevActiveID = prevSnapshot?.active_pane_id || '';
+    const { activePaneOverride, activePaneOverrideAt, paneEcho, paneContent: prevContent, paneVT: prevVT, paneInputModes } = get();
     // A full snapshot (re)seeds the per-pane content/VT store; a layout-only one
     // keeps it (content arrives via pane_output / pane_vt deltas).
     let paneContent = prevContent;
@@ -520,19 +569,32 @@ export const useStore = create<AppStore>((set, get) => ({
       paneVT,
       paneEcho: nextEcho,
       paneInputModes: nextModes,
-      // Clear the override when the snapshot catches up (daemon acked our
-      // focus command), OR when the daemon moved focus somewhere ELSE on its
-      // own — creating a stacked pane focuses the new pane, stack rotation
-      // focuses the rotated-to pane, ##-commands can refocus, etc. A stale
-      // override kept the highlight/keyboard on the old pane while the
-      // expanded pane changed underneath, which looked like panes jumping
-      // between columns on ctrl+p s / ctrl+s navigation.
-      activePaneOverride:
-        activePaneOverride &&
-        s.active_pane_id !== activePaneOverride &&
-        s.active_pane_id === prevActiveID
-          ? activePaneOverride // daemon focus unchanged: still awaiting our ack
-          : null,
+      // Clear the override when the daemon ACKS it, and otherwise leave it
+      // alone until ACTIVE_PANE_OVERRIDE_TTL_MS has passed.
+      //
+      // It used to also clear whenever the daemon moved focus anywhere else,
+      // on the theory that such a move was the user doing something newer.
+      // That is false for the move that matters most: creating a pane focuses
+      // the new pane, so with many panes spawning children — 22 claude panes
+      // each starting another — a creation landing between a click and its ack
+      // discarded the click. Focus then sat on whichever pane had most
+      // recently been created, and PaneBox's 2.5s re-send could not rescue it
+      // because the override it re-sends had already been cleared.
+      //
+      // The cases that rule DID protect — ctrl+p s stack rotation, arrow-key
+      // navigation, focus_tab_index — are all commands this app sends, so they
+      // now clear the override at the point of sending (see
+      // FOCUS_MOVING_ACTIONS in utils/commands.ts). That distinction is the
+      // whole point: a newer USER intent supersedes a click; background churn
+      // does not.
+      activePaneOverride: !activePaneOverride
+        ? null
+        : s.active_pane_id === activePaneOverride
+          ? null // acked
+          : activePaneOverrideAt > 0 &&
+              Date.now() - activePaneOverrideAt > ACTIVE_PANE_OVERRIDE_TTL_MS
+            ? null // never acked — do not wedge the UI on a lost command
+            : activePaneOverride,
     });
   },
 
@@ -641,7 +703,8 @@ export const useStore = create<AppStore>((set, get) => ({
 
   setFullscreenPaneID: (id) => set({ fullscreenPaneID: id }),
 
-  setActivePaneOverride: (id) => set({ activePaneOverride: id }),
+  setActivePaneOverride: (id) =>
+    set({ activePaneOverride: id, activePaneOverrideAt: id ? Date.now() : 0 }),
 
   setEscCount: (count) => set({ escCount: count }),
   setEscTimer: (timer) => set({ escTimer: timer }),
@@ -885,6 +948,43 @@ export const useStore = create<AppStore>((set, get) => ({
       return { paneEcho: rest };
     }),
 
+  // Seeding, batch by batch. Mirrors seedContent()'s per-pane assignment
+  // exactly — wholesale replacement, not an append — because these carry the
+  // pane's CURRENT buffers, not a delta. Reusing appendPaneOutput here would be
+  // wrong: its 'ai' mode writes to both output and aiOutput, so replaying a
+  // snapshot through it would duplicate the AI text inside output.
+  applyPaneContentSeed: (panes) =>
+    set((state) => {
+      const content = { ...state.paneContent };
+      const vt = { ...state.paneVT };
+      const history = { ...state.paneHistory };
+      for (const p of panes) {
+        if (!p?.pane_id) continue;
+        if (p.shell_history || p.prompt_history) {
+          history[p.pane_id] = { shell: p.shell_history || [], prompt: p.prompt_history || [] };
+        }
+        content[p.pane_id] = {
+          output: p.output || '',
+          aiOutput: p.ai_output || '',
+          ryshOutput: p.rysh_output || '',
+          chatOutput: p.chat_output || '',
+          externalOutput: p.external_output || '',
+          modeOutputs: { ...(p.mode_outputs || {}) },
+        };
+        vt[p.pane_id] = {
+          raw_mode: p.raw_mode,
+          vt_screen: p.vt_screen,
+          vt_cursor_row: p.vt_cursor_row,
+          vt_cursor_col: p.vt_cursor_col,
+          remote_interactive: p.remote_interactive,
+          remote_vt_screen: p.remote_vt_screen,
+          remote_vt_cursor_row: p.remote_vt_cursor_row,
+          remote_vt_cursor_col: p.remote_vt_cursor_col,
+        };
+      }
+      return { paneContent: content, paneVT: vt, paneHistory: history };
+    }),
+
   appendPaneOutput: (paneId, mode, text) =>
     set((state) => {
       const buf = state.paneContent[paneId] || { output: '', aiOutput: '', ryshOutput: '', chatOutput: '', externalOutput: '' };
@@ -918,6 +1018,27 @@ export const useStore = create<AppStore>((set, get) => ({
       },
     })),
 
+  setWebEnv: (env) => set({ webEnv: env }),
+
+  setWebPaneFrame: (frame) =>
+    set((state) => {
+      // A fresh frame supersedes any earlier error for the pane.
+      const next: Partial<AppStore> = {
+        webPaneFrames: { ...state.webPaneFrames, [frame.paneId]: frame },
+      };
+      if (state.webPaneErrors[frame.paneId]) {
+        const rest = { ...state.webPaneErrors };
+        delete rest[frame.paneId];
+        next.webPaneErrors = rest;
+      }
+      return next;
+    }),
+
+  setWebPaneError: (paneId, error) =>
+    set((state) => ({
+      webPaneErrors: { ...state.webPaneErrors, [paneId]: error },
+    })),
+
   setWebBinding: (paneId, profile, url) =>
     set((state) => ({
       webBindings: { ...state.webBindings, [paneId]: { profile, url } },
@@ -936,6 +1057,7 @@ export const useStore = create<AppStore>((set, get) => ({
   setVoiceError: (e) => set({ voiceError: e }),
 
   setSidecarPort: (port) => set({ sidecarPort: port }),
+  bumpWsEpoch: () => set((s) => ({ wsEpoch: s.wsEpoch + 1 })),
 
   setWorkspace: (path, name) => set({ workspacePath: path, workspaceName: name }),
 

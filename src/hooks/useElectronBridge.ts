@@ -10,7 +10,10 @@ export function useElectronBridge() {
   useEffect(() => {
     if (!window.electronAPI) return;
 
-    // Fetch the sidecar port
+    // Fetch the sidecar port, which is what triggers the WebSocket connect.
+    // The daemon needs no credential from us: the app spawns it in control
+    // mode (loopback-only, no login), and a daemon it adopts is reached the
+    // same way.
     window.electronAPI.getPort().then((port) => {
       useStore.getState().setSidecarPort(port);
       console.log('[electron] Sidecar port:', port);

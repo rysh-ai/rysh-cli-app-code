@@ -1,0 +1,28 @@
+<!--
+  Rysh app icon — source of truth for icon.icns / icon.ico / icon.png.
+  Regenerate the rasters with scripts/gen-icons.sh after editing this file.
+
+  Derived from the site brand mark (rysh-server/web/public/favicon.svg): the
+  terminal-prompt chevron plus input line, #38bdf8 on #0f1117.
+
+  Laid out on Apple's icon grid: a 1024 canvas with the app shape inset to
+  824x824 (100pt margin) and a 185.4 corner radius. macOS draws no mask of its
+  own for .icns, so the artwork must carry the rounded square itself, and the
+  margin is what keeps it the same visual size as every other Dock icon.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- Barely-there vertical lift; reads as depth at 512px and disappears at 32px. -->
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#171b24"/>
+      <stop offset="1" stop-color="#0b0d12"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="100" y="100" width="824" height="824" rx="185.4" ry="185.4" fill="url(#bg)"/>
+
+  <g fill="none" stroke="#38bdf8" stroke-width="66.95" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M331.75 396.125 L460.5 512 L331.75 627.875"/>
+    <path d="M524.875 640.75 H692.25"/>
+  </g>
+</svg>

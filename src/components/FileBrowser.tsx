@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { apiFetch } from '../utils/auth';
 
 // FileBrowser — port of rysh-mobile's FileBrowserScreen + FileViewerScreen to
 // the web mobile view. Full-screen overlay over the pane screen: browse the
@@ -21,19 +22,11 @@ interface FsEntry {
   mime: string;
 }
 
-// Base URL prefix for same-origin API calls. The bundle may be served behind
-// a prefix-stripping reverse proxy (dev.rysh.ai/ryshweb/<dev>/ → /), where an
-// absolute "/fs/list" would escape the proxied subtree — so derive the prefix
-// from the page path by dropping the "mobile" segment.
-function apiBase(): string {
-  let base = window.location.pathname.replace(/mobile\/?$/, '');
-  if (!base.endsWith('/')) base += '/';
-  return base;
-}
-
 async function fsGet(op: 'list' | 'read', params: Record<string, string>): Promise<any> {
   const q = new URLSearchParams(params).toString();
-  const resp = await fetch(`${apiBase()}fs/${op}?${q}`);
+  // apiFetch resolves the path against the page prefix (so a prefix-stripping
+  // reverse proxy still works) and carries the login token when there is one.
+  const resp = await apiFetch(`fs/${op}?${q}`);
   const body = await resp.json();
   if (!body.ok) {
     throw new Error(body.message || body.error || 'file browse failed');

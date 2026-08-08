@@ -6,24 +6,38 @@ directories:
   buildResources: resources
   output: release
 
-extraResources:
-  - from: sidecar/
-    to: sidecar/
-    filter:
-      - "**/*"
+# The Go sidecar dominates the payload, so squeezing it is worth paying for.
+# Measured cost: the mac job (2 arches x dmg+zip) goes from a few minutes to
+# ~20. That is fine for a tag-triggered release and painful for iteration — use
+# `npx electron-builder --mac --arm64` with this line commented out when you are
+# debugging packaging, not the full matrix.
+compression: maximum
 
 files:
   - dist/**/*
   - "!node_modules/**/*"
 
+# NOTE: there is deliberately no top-level `extraResources`. It used to be
+# `from: sidecar/` with `filter: ["**/*"]`, which copied *everything* in that
+# directory into the bundle: all five cross-compiled platform binaries (~260MB
+# of sidecars the target can never execute), any stale `*.bak-*` files sitting
+# there, and `sidecar/.rysh/` — a runtime state directory holding NATS
+# JetStream data, sessions and the secrets KV. CI happened to mask this because
+# each job built exactly one binary, but `make package` locally would have
+# shipped all of it. Each platform block below takes only its own sidecar.
+
 mac:
   category: public.app-category.developer-tools
+  icon: resources/icon.icns
+  # Requires macOS 12 (Monterey) — inherited from Electron 41, not chosen here.
+  # Keep the download page in sync if the Electron major changes.
+  artifactName: ${productName}-${version}-mac-${arch}.${ext}
   target:
     - target: dmg
       arch:
         - arm64
         - x64
-    - target: zip
+    - target: zip # electron-updater downloads the zip, not the dmg
       arch:
         - arm64
         - x64
@@ -34,22 +48,42 @@ mac:
   entitlementsInherit: resources/entitlements.mac.plist
   extendInfo:
     NSMicrophoneUsageDescription: Rysh uses the microphone for voice prompting (speech-to-text).
+  extraResources:
+    # ${arch} is the arch of the artifact being built, so an arm64 dmg carries
+    # only rysh-darwin-arm64. Matches resolveBinaryPath() in electron/sidecar.ts.
+    - from: sidecar/rysh-darwin-${arch}
+      to: sidecar/rysh-darwin-${arch}
+    - from: resources/tray-iconTemplate.png
+      to: tray-iconTemplate.png
+    - from: resources/tray-iconTemplate@2x.png
+      to: tray-iconTemplate@2x.png
+  # Code signing and notarization are NOT configured yet — see
+  # docs/RELEASE-PLAN.md §B1. Until a Developer ID Application certificate
+  # exists, CI builds unsigned (CSC_IDENTITY_AUTO_DISCOVERY=false) and the
+  # artifacts are not fit for public download: Gatekeeper rejects them and
+  # electron-updater refuses to install unsigned updates. To enable, add the
+  # CSC_*/APPLE_API_* secrets, drop that env var from the workflow, and add:
+  #   notarize:
+  #     teamId: <APPLE_TEAM_ID>
 
-win:
-  target:
-    - target: nsis
-      arch:
-        - x64
-
-nsis:
-  oneClick: false
-  allowToChangeInstallationDirectory: true
-  perMachine: false
+# Windows is intentionally absent. rysh-cli sets PTYSupported=false on native
+# Windows (internal/platform/pty_windows.go) because its PTY layer, creack/pty,
+# is a stub there — the binary links and runs, then every pane fails the moment
+# the user opens one. Shipping a terminal multiplexer that cannot allocate a
+# terminal is worse than shipping nothing; WSL2 is the supported path for the
+# CLI. rysh-cli's own release workflow disabled its Chocolatey and WinGet jobs
+# for exactly this reason. Re-enable here once ConPTY lands (design 011) —
+# resources/icon.ico is already generated and waiting.
 
 linux:
   category: Development
+  icon: resources/icon.png
+  # Not `rysh`: the CLI package installs /usr/local/bin/rysh, and a desktop
+  # package claiming the same command name would shadow it on PATH.
+  executableName: rysh-desktop
   # Required by the .deb (fpm) target as the package maintainer.
   maintainer: Rysh <info@rysh.ai>
+  artifactName: ${productName}-${version}-linux-${arch}.${ext}
   target:
     # x64 only: CI builds a linux/amd64 Go sidecar, so an arm64 AppImage would
     # ship a wrong-arch binary. rpm is omitted (needs rpmbuild on the runner).
@@ -59,8 +93,24 @@ linux:
     - target: deb
       arch:
         - x64
+  extraResources:
+    - from: sidecar/rysh-linux-${arch}
+      to: sidecar/rysh-linux-${arch}
+    - from: resources/tray-icon.png
+      to: tray-icon.png
+    - from: resources/tray-icon@2x.png
+      to: tray-icon@2x.png
 
+deb:
+  packageName: rysh-desktop
+  artifactName: rysh-desktop_${version}_${arch}.deb
+
+# Artifacts are served from Cloudflare R2 behind packages.rysh.ai — the same
+# bucket and CDN the CLI already publishes to. GitHub Releases is not an option:
+# rysh-ai/rysh-cli-app is a private repo, so both the download URLs and the
+# update feed would 404 for every user. (The previous config pointed at
+# `owner: rysh`, which is not even the right org.)
 publish:
-  provider: github
-  owner: rysh
-  repo: rysh-cli-app
+  provider: generic
+  url: https://packages.rysh.ai/desktop
+  channel: latest

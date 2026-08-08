@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useKeyboard } from './hooks/useKeyboard';
 import { useElectronBridge } from './hooks/useElectronBridge';
+import { useWebBridge } from './hooks/useWebBridge';
 import { useClipboard } from './hooks/useClipboard';
 import { useStore } from './store';
 import { Header } from './components/Header';
@@ -19,6 +20,7 @@ import { ControlDashboard } from './components/ControlDashboard';
 
 export default function App() {
   useElectronBridge();
+  useWebBridge();
   useWebSocket();
   useKeyboard();
   useClipboard();

@@ -1,0 +1,11 @@
+<!--
+  Linux tray glyph. Linux status-icon hosts do no recolouring, and a black
+  template image is invisible on the dark panels most desktops ship by default —
+  so this one carries the brand colour. Same geometry as tray-icon-template.svg.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <g fill="none" stroke="#38bdf8" stroke-width="4.16" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4.8 8.4 L12.8 15.6 L4.8 22.8"/>
+    <path d="M16.8 22.8 H27.2"/>
+  </g>
+</svg>

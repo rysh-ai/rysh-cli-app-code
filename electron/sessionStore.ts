@@ -9,13 +9,29 @@ export interface AppSession {
   name: string
   state: string
   updatedAt: string
-  /** 'app' (rysh desktop app) or 'cli' (rysh command line). */
+  /**
+   * Which front-end CREATED the session: 'app' (rysh desktop app) or 'cli'
+   * (rysh command line). This is provenance, not ownership — the app opens
+   * either kind. It is kept because the app is a superset of the terminal, so
+   * a session created here may use surfaces a terminal cannot paint, and the
+   * picker labels the origin so the user knows what they are joining.
+   */
   source: 'app' | 'cli'
   /**
    * Live desktop-app (WebSocket) clients connected to the session's daemon.
    * > 0 means another app window is attached to it right now.
    */
   appClients: number
+  /** The daemon process, or 0 when the session is stopped. */
+  pid: number
+  /**
+   * The daemon's live loopback web-server port, or 0 when it has none. This is
+   * the app's door into a daemon it did not spawn: the renderer speaks only
+   * HTTP/WebSocket, so a session with no web server is unreachable until one is
+   * started (see ensureWebEndpoint in sidecar.ts). App-created daemons always
+   * have one; command-line ones start theirs on demand.
+   */
+  webPort: number
 }
 
 /** Shape of the JSON the daemon writes (snake_case keys). */
@@ -25,6 +41,8 @@ interface RawRecord {
   updated_at?: string
   source?: string
   app_clients?: number
+  pid?: number
+  web_port?: number
 }
 
 /**
@@ -65,6 +83,8 @@ export function listSessions(workspaceRoot: string): AppSession[] {
         // side's session.NormalizeSource (only "app" is the app).
         source: rec.source === 'app' ? 'app' : 'cli',
         appClients: typeof rec.app_clients === 'number' ? rec.app_clients : 0,
+        pid: typeof rec.pid === 'number' ? rec.pid : 0,
+        webPort: typeof rec.web_port === 'number' ? rec.web_port : 0,
       })
     } catch {
       // Skip unreadable / malformed records.
@@ -76,11 +96,17 @@ export function listSessions(workspaceRoot: string): AppSession[] {
 }
 
 /**
- * Sessions this app owns (source === 'app'). These are the only ones the picker
- * offers; the app never opens command-line sessions.
+ * Every session in the workspace, whichever front-end created it — the set the
+ * picker offers.
+ *
+ * This used to filter to `source === 'app'`, because the two front-ends refused
+ * to open each other's sessions. They no longer do: both drive the same daemon
+ * over the same subjects, and the desktop app is a strict superset of the
+ * terminal's render surfaces, so it opens a command-line session with nothing
+ * lost. The picker labels each session's origin instead of hiding half of them.
  */
-export function listAppSessions(workspaceRoot: string): AppSession[] {
-  return listSessions(workspaceRoot).filter((s) => s.source === 'app')
+export function listOpenableSessions(workspaceRoot: string): AppSession[] {
+  return listSessions(workspaceRoot)
 }
 
 /** The existing record for `name` in this workspace, or null. */

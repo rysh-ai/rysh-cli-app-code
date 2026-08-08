@@ -1,12 +1,32 @@
 .PHONY: help dev start stop restart status logs build build-app \
-        package package-mac package-win package-linux clean \
-        build-sidecar build-sidecar-local install typecheck
+        package package-mac package-linux clean icons \
+        build-sidecar build-sidecar-local build-sidecar-mac build-sidecar-linux \
+        install typecheck
 
 # Go CLI source directory (the full rysh binary serves as the sidecar)
 GO_CLI_SRC := ../rysh-cli-code
 
 # Sidecar output directory
 SIDECAR_DIR := sidecar
+
+# Strip the DWARF tables and symbol table from the sidecar. It is the single
+# largest thing in the bundle (~66MB unstripped) and nothing in the app reads
+# its symbols — Go panics still carry a usable stack trace without them.
+GO_LDFLAGS := -s -w
+
+# Host CPU architecture, for the local sidecar build.
+#
+# Deliberately NOT `go env GOARCH`: that reports what the INSTALLED TOOLCHAIN
+# targets, which is not always what this machine is. An amd64 Go on an Apple
+# Silicon Mac reports amd64, so build-sidecar-local wrote sidecar/rysh-darwin-x64
+# while the app loads sidecar/rysh-darwin-arm64 — the build "succeeded" and the
+# app kept running whatever stale arm64 binary was already there.
+#
+# Under Rosetta `uname -m` lies too (x86_64 on an arm64 Mac); sysctl.proc_translated
+# is the tell. Everything else maps uname's spelling onto Go's.
+HOST_ARCH := $(shell \
+	if [ "$$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" ]; then echo arm64; \
+	else uname -m | sed -e 's/^x86_64$$/amd64/' -e 's/^aarch64$$/arm64/'; fi)
 
 # Absolute project root. start/stop/status match processes by this path so they
 # only ever touch THIS app — its dev server, Electron, and the daemons it
@@ -42,10 +62,10 @@ help:
 	@echo "    build-app             full local build: sidecar (this platform) + JS bundles"
 	@echo "    build                 JS bundles only (electron-vite build)"
 	@echo "    build-sidecar-local   build the Go daemon for this platform"
-	@echo "    build-sidecar         cross-compile the daemon for all platforms"
-	@echo "    package[-mac|-win|-linux]   build a distributable app"
+	@echo "    build-sidecar         cross-compile the daemon for every shipping target"
+	@echo "    package[-mac|-linux]  build a distributable app"
 	@echo ""
-	@echo "  Misc: install · typecheck · clean"
+	@echo "  Misc: install · typecheck · icons · clean"
 
 # ── Development ──
 
@@ -122,45 +142,62 @@ build-app: build-sidecar-local build
 
 # ── Sidecar (Go backend — full rysh binary) ──
 
-# Build sidecar for the current platform only (for dev)
+# Build sidecar for the current platform only (for dev).
+#
+# GOOS/GOARCH are passed to `go build` explicitly rather than left to the
+# toolchain's defaults, so a toolchain built for another architecture
+# cross-compiles for THIS machine instead of producing a binary the app will
+# never load. See HOST_ARCH above.
 build-sidecar-local:
 	@mkdir -p $(SIDECAR_DIR)
-	@echo "Building rysh sidecar for $$(go env GOOS)/$$(go env GOARCH)..."
-	@GOOS=$$(go env GOOS) GOARCH=$$(go env GOARCH) && \
+	@echo "Building rysh sidecar for $$(go env GOOS)/$(HOST_ARCH)..."
+	@GOOS=$$(go env GOOS) && GOARCH=$(HOST_ARCH) && \
 	if [ "$$GOOS" = "darwin" ]; then \
 		SUFFIX="darwin-$$([ $$GOARCH = arm64 ] && echo arm64 || echo x64)"; \
 	elif [ "$$GOOS" = "linux" ]; then \
 		SUFFIX="linux-$$([ $$GOARCH = arm64 ] && echo arm64 || echo x64)"; \
-	elif [ "$$GOOS" = "windows" ]; then \
-		SUFFIX="win-x64.exe"; \
 	fi && \
-	cd $(GO_CLI_SRC) && GOWORK=off go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-$$SUFFIX ./cmd/rysh && \
+	cd $(GO_CLI_SRC) && GOWORK=off GOOS=$$GOOS GOARCH=$$GOARCH go build -ldflags="$(GO_LDFLAGS)" -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-$$SUFFIX ./cmd/rysh && \
 	echo "Built: $(SIDECAR_DIR)/rysh-$$SUFFIX"
 
-# Build sidecar for all platforms (for distribution)
-build-sidecar:
+# Both macOS architectures. `make package-mac` needs both, because
+# electron-builder.yml builds an arm64 and an x64 dmg and each pulls its own
+# sidecar — an Apple Silicon dmg cannot satisfy an Intel Mac (Rosetta
+# translates x64 to arm64, never the reverse).
+build-sidecar-mac:
 	@mkdir -p $(SIDECAR_DIR)
-	@echo "Cross-compiling rysh sidecar for all platforms..."
+	@echo "Cross-compiling rysh sidecar for darwin/arm64 + darwin/amd64..."
 	cd $(GO_CLI_SRC) && \
-	GOWORK=off GOOS=darwin  GOARCH=arm64 go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-darwin-arm64 ./cmd/rysh && \
-	GOWORK=off GOOS=darwin  GOARCH=amd64 go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-darwin-x64   ./cmd/rysh && \
-	GOWORK=off GOOS=linux   GOARCH=amd64 go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-linux-x64    ./cmd/rysh && \
-	GOWORK=off GOOS=linux   GOARCH=arm64 go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-linux-arm64  ./cmd/rysh && \
-	GOWORK=off GOOS=windows GOARCH=amd64 go build -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-win-x64.exe  ./cmd/rysh
+	GOWORK=off GOOS=darwin GOARCH=arm64 go build -ldflags="$(GO_LDFLAGS)" -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-darwin-arm64 ./cmd/rysh && \
+	GOWORK=off GOOS=darwin GOARCH=amd64 go build -ldflags="$(GO_LDFLAGS)" -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-darwin-x64   ./cmd/rysh
+
+build-sidecar-linux:
+	@mkdir -p $(SIDECAR_DIR)
+	@echo "Cross-compiling rysh sidecar for linux/amd64..."
+	cd $(GO_CLI_SRC) && \
+	GOWORK=off GOOS=linux GOARCH=amd64 go build -ldflags="$(GO_LDFLAGS)" -o ../rysh-cli-app-code/$(SIDECAR_DIR)/rysh-linux-x64 ./cmd/rysh
+
+# Every sidecar a shipping target needs. Windows is not built: rysh has no PTY
+# on native Windows, so that target is not shipped (see docs/RELEASE-PLAN.md).
+build-sidecar: build-sidecar-mac build-sidecar-linux
 	@echo "All sidecar binaries built."
+
+# ── Icons ──
+
+# Rasterise resources/*.svg into the icns/ico/png the packager consumes. The
+# outputs are checked in, so this only needs re-running when an SVG changes.
+icons:
+	./scripts/gen-icons.sh
 
 # ── Packaging ──
 
 package: build-sidecar build
 	npm run package
 
-package-mac: build-sidecar-local build
+package-mac: build-sidecar-mac build
 	npm run make:mac
 
-package-win: build-sidecar build
-	npm run make:win
-
-package-linux: build-sidecar build
+package-linux: build-sidecar-linux build
 	npm run make:linux
 
 # ── Cleanup ──

@@ -4,6 +4,29 @@ import { app } from 'electron'
 import { is } from '@electron-toolkit/utils'
 import * as http from 'http'
 import { DaemonRegistry, isPidAlive } from './daemonRegistry'
+import { findSession } from './sessionStore'
+
+/**
+ * The embedded-NATS port rysh-cli falls back to when none is configured
+ * (internal/config/config.go — NATSConfig.Port). Mirrored here so the app can
+ * tell whether the daemon's default is free before letting it take that path.
+ */
+const DEFAULT_NATS_PORT = 24242
+
+/**
+ * The outcome of looking for a live daemon's web endpoint (see
+ * SidecarManager.ensureWebEndpoint):
+ *
+ * - endpoint:    a reachable web server — adopt it
+ * - none:        no live daemon at all — cold-starting one is safe
+ * - unreachable: a daemon IS alive but we cannot reach it. Never cold-start
+ *   over this: a second daemon on the same session name would answer the same
+ *   ws.* subjects as the first.
+ */
+export type EndpointLookup =
+  | { kind: 'endpoint'; port: number; pid: number }
+  | { kind: 'none' }
+  | { kind: 'unreachable'; pid: number; reason: string }
 
 /**
  * SidecarManager manages the Go backend process lifecycle.
@@ -73,11 +96,98 @@ export class SidecarManager {
   }
 
   /**
-   * Adopt a daemon that a previous app run left running (via Detach) instead of
-   * spawning a new one — preserving its full in-memory state (running shells,
-   * scrollback, agent state). Verifies the recorded PID is alive and its web
-   * server answers /health on the recorded port. Returns true on success; on
-   * failure the caller should fall back to start() (cold restore from KV).
+   * Find a live daemon's web endpoint for {cwd, session}, starting its web
+   * server if it has none.
+   *
+   * This is what lets the app open a session it did not create. The app's own
+   * daemons are spawned with RYSH_WEB_AUTO_START, so they always have a web
+   * server and the private registry knows its port. A COMMAND-LINE daemon has
+   * neither: nothing listens, and the app's registry has never heard of it. The
+   * renderer speaks only HTTP/WebSocket, so such a session was simply
+   * unreachable — that, not the layout or the protocol, is what actually kept
+   * the two front-ends apart.
+   *
+   * Two things fixed it. The daemon now advertises its endpoint on the session
+   * record (session.UpdateWebEndpoint), so any front-end can discover a door
+   * that already exists; and when there is none, `rysh web start` asks the live
+   * daemon to open one over NATS — the same in-daemon `##rysh web start` a user
+   * would run — with the posture the app's own daemons already use: --control,
+   * which forces a loopback bind and (per autoStartWebToken) leaves it
+   * untokened. No new trust boundary; the same one, reached deliberately.
+   *
+   * The three outcomes are distinct because they demand different responses,
+   * and collapsing 'none' with 'unreachable' is actively dangerous: cold-starting
+   * a second daemon for a session whose daemon is ALIVE would put two daemons on
+   * one session name, both answering the same ws.* subjects.
+   */
+  async ensureWebEndpoint(sessionName: string, cwd: string): Promise<EndpointLookup> {
+    const rec = findSession(cwd, sessionName)
+    if (!rec || rec.pid <= 0 || !isPidAlive(rec.pid)) {
+      return { kind: 'none' } // nothing live — the caller may safely cold-start
+    }
+
+    // A door already advertised and answering: use it as-is.
+    if (rec.webPort > 0 && (await this.probeHealth(rec.webPort))) {
+      return { kind: 'endpoint', port: rec.webPort, pid: rec.pid }
+    }
+
+    // Live daemon, no reachable web server — ask it to open one.
+    let port: number
+    try {
+      port = await this.findFreePort()
+    } catch {
+      return { kind: 'unreachable', pid: rec.pid, reason: 'no free port for a web server' }
+    }
+    try {
+      execFileSync(
+        this.resolveBinaryPath(),
+        // --control is what makes this startable at all: a user-invoked
+        // `##rysh web start` demands a username/password login, while control
+        // mode is loopback-only and serves just this app.
+        ['web', 'start', sessionName, '--control', '--port', String(port)],
+        { cwd, env: { ...process.env, HOME: app.getPath('home') }, timeout: 20000, stdio: 'pipe' }
+      )
+    } catch (err) {
+      return {
+        kind: 'unreachable',
+        pid: rec.pid,
+        reason: `could not request a web server: ${err instanceof Error ? err.message : err}`,
+      }
+    }
+
+    // `rysh web start` is FIRE-AND-FORGET: it sends `##rysh web start` into the
+    // session's active pane and returns immediately, so the exec above
+    // succeeding says only that the request was delivered. The daemon writes
+    // the endpoint onto the record once its listener is actually up, so poll
+    // the record — and trust what it says rather than the port we asked for,
+    // since a start that lost a port race reports the port that won.
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 300))
+      const fresh = findSession(cwd, sessionName)
+      if (fresh && fresh.webPort > 0 && (await this.probeHealth(fresh.webPort))) {
+        return {
+          kind: 'endpoint',
+          port: fresh.webPort,
+          pid: fresh.pid || rec.pid,
+        }
+      }
+    }
+    return {
+      kind: 'unreachable',
+      pid: rec.pid,
+      reason: 'its web server never advertised a reachable port',
+    }
+  }
+
+  /**
+   * Adopt a daemon that a previous app run left running (via Detach), or one
+   * this app never spawned at all (a command-line session — see
+   * ensureWebEndpoint), instead of spawning a new one. Adoption preserves the
+   * daemon's full in-memory state: running shells, scrollback, agent state.
+   *
+   * Verifies the PID is alive and the web server answers /health on the given
+   * port. Returns true on success; on failure the caller should fall back to
+   * start() (cold restore from KV).
    */
   async adopt(sessionName: string, cwd: string, webPort: number, pid: number): Promise<boolean> {
     if (!isPidAlive(pid)) {
@@ -137,7 +247,6 @@ export class SidecarManager {
   async start(): Promise<void> {
     this.stopping = false
     this.adoptedPid = null
-
     // Reap any sidecar left over from a previous run BEFORE starting a new one.
     // A force-quit or crash skips before-quit (so stop() never ran) and leaves
     // the detached daemon alive. Two daemons for the same session on a shared
@@ -151,7 +260,9 @@ export class SidecarManager {
     const binaryPath = this.resolveBinaryPath()
     const cwd = this.cwdKey()
 
-    const natsPortNote = this.natsPort ? ` (NATS port: ${this.natsPort})` : ''
+    const { natsPort, natsDataDir } = await this.resolveNatsBroker()
+
+    const natsPortNote = natsPort ? ` (NATS port: ${natsPort})` : ''
     console.log(
       `[sidecar] Starting: ${binaryPath} daemon ${this.sessionName} (web port: ${this.port})${natsPortNote}`
     )
@@ -185,12 +296,13 @@ export class SidecarManager {
     // clients. Both are needed: a distinct port keeps the secondary from
     // connecting to the primary's broker, and a distinct store keeps the two
     // embedded servers from fighting over ~/.rysh/nats. The primary omits both
-    // and uses the daemon's 24242 default + per-workspace store (legacy).
-    if (this.natsPort) {
-      env.RYSH_NATS_PORT = String(this.natsPort)
+    // and uses the daemon's 24242 default + per-workspace store (legacy) —
+    // unless that default is already taken, which resolveNatsBroker() handles.
+    if (natsPort) {
+      env.RYSH_NATS_PORT = String(natsPort)
     }
-    if (this.natsDataDir) {
-      env.RYSH_NATS_DATA_DIR = this.natsDataDir
+    if (natsDataDir) {
+      env.RYSH_NATS_DATA_DIR = natsDataDir
     }
 
     this.process = spawn(binaryPath, ['daemon', this.sessionName], {
@@ -274,7 +386,6 @@ export class SidecarManager {
     this.stopping = true
     const cwd = this.cwdKey()
     const session = this.sessionName
-
     // Forget the daemon SYNCHRONOUSLY, before any await or kill: app quit calls
     // this from an async before-quit handler that Electron does NOT await, so a
     // registry write deferred past an await can be lost when the process tears
@@ -457,30 +568,74 @@ export class SidecarManager {
    * The sidecar is the full `rysh` binary.
    */
   private resolveBinaryPath(): string {
-    const platform = process.platform
-    const arch = process.arch
-
-    let binaryName = 'rysh'
-    if (platform === 'darwin') {
-      binaryName += `-darwin-${arch === 'arm64' ? 'arm64' : 'x64'}`
-    } else if (platform === 'linux') {
-      binaryName += `-linux-${arch === 'arm64' ? 'arm64' : 'x64'}`
-    } else if (platform === 'win32') {
-      binaryName += '-win-x64.exe'
-    }
-
-    if (is.dev) {
-      // In development, look in the sidecar/ directory relative to project root
-      return join(app.getAppPath(), 'sidecar', binaryName)
-    }
-
-    // In production, look in the extraResources/sidecar/ directory
-    return join(process.resourcesPath, 'sidecar', binaryName)
+    return resolveSidecarBinaryPath()
   }
 
   /**
    * Find a free port for the web server to listen on.
    */
+  /**
+   * Decide which embedded-NATS broker this daemon should run.
+   *
+   * Secondaries are already pinned to a private port + store by
+   * instanceManager, so they pass straight through. The PRIMARY normally takes
+   * the daemon's built-in 24242 default — but that default is not ours to
+   * assume. A CLI-started daemon (`rysh daemon <name>`) binds the very same
+   * port, and rysh-cli's bus deliberately REUSES an existing broker instead of
+   * failing (see internal/bus/bus.go, the "An existing NATS server is running
+   * — reuse it" branch).
+   *
+   * Sharing a broker is safe in principle — KV buckets and subjects are both
+   * namespaced per session — but it is ruinously expensive in practice: the
+   * app's daemon becomes a TCP client of the CLI's broker, so every pane
+   * snapshot crosses a loopback socket and is serialized twice instead of
+   * staying in-process. Measured on a busy session: ~100 MB/s of snapshot
+   * traffic, 200% CPU in the daemon, and 5.2 TB of loopback in 16 hours.
+   *
+   * So the primary claims 24242 only when it is genuinely free. Otherwise it
+   * falls back to its own port and store, exactly like a secondary. This runs
+   * after killStaleSidecars(), so a still-occupied port belongs to somebody
+   * else — a CLI daemon or another session — not to a leftover of our own.
+   */
+  private async resolveNatsBroker(): Promise<{
+    natsPort: number | null
+    natsDataDir: string | null
+  }> {
+    if (this.natsPort) {
+      return { natsPort: this.natsPort, natsDataDir: this.natsDataDir }
+    }
+    if (!(await this.isPortInUse(DEFAULT_NATS_PORT))) {
+      return { natsPort: null, natsDataDir: this.natsDataDir }
+    }
+    const natsPort = await this.findFreePort()
+    const natsDataDir = this.natsDataDir ?? join(app.getPath('userData'), 'nats-primary')
+    console.warn(
+      `[sidecar] NATS ${DEFAULT_NATS_PORT} is already in use (most likely a CLI-started ` +
+        `daemon). Running a private broker on ${natsPort} instead of joining it — sharing ` +
+        `a broker would push every pane snapshot over a loopback socket.`
+    )
+    return { natsPort, natsDataDir }
+  }
+
+  /** True if something is already listening on 127.0.0.1:<port>. */
+  private isPortInUse(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const socket = new (require('net').Socket)()
+      const settle = (inUse: boolean): void => {
+        socket.destroy()
+        resolve(inUse)
+      }
+      socket.setTimeout(500)
+      socket.once('connect', () => settle(true))
+      // A refused connection means free; a timeout means nothing usable is
+      // answering, and claiming the port would fail loudly rather than
+      // silently joining a foreign broker.
+      socket.once('timeout', () => settle(false))
+      socket.once('error', () => settle(false))
+      socket.connect(port, '127.0.0.1')
+    })
+  }
+
   private findFreePort(): Promise<number> {
     return new Promise((resolve, reject) => {
       const server = require('net').createServer()
@@ -495,6 +650,26 @@ export class SidecarManager {
         })
       })
       server.on('error', reject)
+    })
+  }
+
+  /**
+   * One-shot liveness probe of a web server's /health on loopback. /health is
+   * deliberately exempt from the access-token gate, so this answers for a
+   * tokened server too. Used to tell "a door is advertised" apart from "a door
+   * is actually open" before committing to adopt a port.
+   */
+  private probeHealth(port: number, timeoutMs = 1500): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      const req = http.get(`http://127.0.0.1:${port}/health`, (res) => {
+        res.resume() // drain, so the socket can close
+        resolve(res.statusCode === 200)
+      })
+      req.setTimeout(timeoutMs, () => {
+        req.destroy()
+        resolve(false)
+      })
+      req.on('error', () => resolve(false))
     })
   }
 
@@ -530,4 +705,66 @@ export class SidecarManager {
       setTimeout(check, 1000)
     })
   }
+}
+
+/**
+ * Path to the bundled `rysh` binary for the running platform/architecture.
+ *
+ * The names match the per-platform `extraResources` entries in
+ * electron-builder.yml, which ship exactly one binary per artifact — so a
+ * mismatch here is a missing file at runtime, not a fallback.
+ */
+export function resolveSidecarBinaryPath(): string {
+  const platform = process.platform
+  const arch = process.arch
+
+  let binaryName = 'rysh'
+  if (platform === 'darwin') {
+    binaryName += `-darwin-${arch === 'arm64' ? 'arm64' : 'x64'}`
+  } else if (platform === 'linux') {
+    binaryName += `-linux-${arch === 'arm64' ? 'arm64' : 'x64'}`
+  } else if (platform === 'win32') {
+    // Not a shipping target — rysh has no PTY on native Windows. Kept so a dev
+    // run on Windows resolves to something nameable rather than "rysh".
+    binaryName += '-win-x64.exe'
+  }
+
+  if (is.dev) {
+    // In development, look in the sidecar/ directory relative to project root
+    return join(app.getAppPath(), 'sidecar', binaryName)
+  }
+
+  // In production, look in the extraResources/sidecar/ directory
+  return join(process.resourcesPath, 'sidecar', binaryName)
+}
+
+let cachedSidecarVersion: string | null = null
+
+/**
+ * Version string of the bundled `rysh` binary, e.g. "v0.2.1".
+ *
+ * The desktop app and the CLI version independently, so a bug report that
+ * names only one of them is ambiguous — the About panel shows both. Resolved
+ * by running the binary once and cached: it is a ~50MB process spawn, and the
+ * answer cannot change while the app is running.
+ *
+ * Returns "unknown" rather than throwing; a diagnostic string is never worth
+ * failing a menu over.
+ */
+export function getSidecarVersion(): string {
+  if (cachedSidecarVersion !== null) return cachedSidecarVersion
+
+  try {
+    // `rysh --version` prints e.g. "rysh v0.2.1 (commit: abc1234, built: ...)".
+    // Keep the version token; the rest is noise in a dialog.
+    const out = execFileSync(resolveSidecarBinaryPath(), ['--version'], {
+      encoding: 'utf8',
+      timeout: 5000,
+    }).trim()
+    cachedSidecarVersion = out.split(/\s+/)[1] ?? out
+  } catch {
+    cachedSidecarVersion = 'unknown'
+  }
+
+  return cachedSidecarVersion
 }

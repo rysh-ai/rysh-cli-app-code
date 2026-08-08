@@ -1,11 +1,20 @@
-import { useCallback, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { sendCommand } from '../utils/commands';
+import { useStore } from '../store';
 
 /**
  * usePaneResize keeps a pane's PTY + virtual terminal sized to the actual
  * on-screen content area, measured in monospace character cells. Without it the
  * daemon's PTY stays at its 80x24 default, so interactive apps (vim, claude,
  * htop) only fill ~24 rows regardless of how tall the pane really is.
+ *
+ * What it sends is a size CLAIM, not a command. A pane has one PTY but can be
+ * on screen in several viewports at once — another app window, or a terminal UI
+ * attached to the same daemon — and the daemon sizes the PTY to the SMALLEST of
+ * them, so the grid fits inside every viewport showing it. This window may
+ * therefore end up rendering a grid smaller than its pane, with space around
+ * it; that is the correct outcome, since the alternative is a smaller viewport
+ * having to truncate a full-screen app's display.
  *
  * Returns a callback ref to attach to the pane's content container. The callback
  * ref (rather than a useEffect) is deliberate: a stacked pane's content node
@@ -48,7 +57,30 @@ export function usePaneResize(paneId: string): (el: HTMLElement | null) => void 
     timer: ReturnType<typeof setTimeout> | null;
     rows: number;
     cols: number;
-  }>({ ro: null, timer: null, rows: 0, cols: 0 });
+    el: HTMLElement | null;
+  }>({ ro: null, timer: null, rows: 0, cols: 0, el: null });
+
+  // Re-claim on reconnect. The daemon keys size claims by CONNECTION and drops
+  // them when a socket closes, so a reconnected window holds none. The
+  // last-sent cache below would otherwise suppress the re-send as "unchanged"
+  // and this window would stop constraining its panes until the user happened
+  // to resize something. Clearing the cache makes the next measure re-send.
+  const wsEpoch = useStore((s) => s.wsEpoch);
+  const seenEpoch = useRef(wsEpoch);
+  useEffect(() => {
+    if (wsEpoch === seenEpoch.current) return; // mount, not a reconnect
+    seenEpoch.current = wsEpoch;
+    const s = st.current;
+    s.rows = 0;
+    s.cols = 0;
+    if (!s.el) return;
+    const rect = s.el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const { w, h } = measureCell();
+    s.cols = Math.max(1, Math.floor((rect.width - PAD_X) / w));
+    s.rows = Math.max(1, Math.floor((rect.height - PAD_Y) / h));
+    sendCommand('pane_resize', { pane_id: paneId, rows: s.rows, cols: s.cols });
+  }, [wsEpoch, paneId]);
 
   return useCallback(
     (el: HTMLElement | null) => {
@@ -62,6 +94,9 @@ export function usePaneResize(paneId: string): (el: HTMLElement | null) => void 
         clearTimeout(s.timer);
         s.timer = null;
       }
+      // Remembered so the reconnect effect above can re-measure without waiting
+      // for the ResizeObserver to fire (it won't — nothing on screen moved).
+      s.el = el;
       if (!el) return;
 
       const { w, h } = measureCell();
