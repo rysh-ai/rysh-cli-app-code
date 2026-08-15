@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { WorkspaceSnapshot, PaneSnapshot, PaneSeed, PendingApproval, AppMode, InputMode, WebPaneStatus, WebEnv, WebPaneFrame, AgentInfo, HumanoidInfo, ShareInfo, EmailSummary, EmailDetail, WhatsAppMsgSummary, WhatsAppMsgDetail, PairingState, PairingQR, PairingStatusInfo, DashboardTab, PendingPair } from './types';
+import type { WorkspaceSnapshot, TabSnapshot, PaneSnapshot, PaneSeed, PendingApproval, AppMode, InputMode, WebPaneStatus, WebEnv, WebPaneFrame, BoardData, ClipboardContent, AgentInfo, HumanoidInfo, ShareInfo, EmailSummary, EmailDetail, WhatsAppMsgSummary, WhatsAppMsgDetail, PairingState, PairingQR, PairingStatusInfo, DashboardTab, PendingPair } from './types';
 import { FIXED_INPUT_MODES } from './types';
 
 // Tracks the last-seen web_profile per pane so setSnapshot can auto-activate web
@@ -51,6 +51,72 @@ export function findPane(snapshot: WorkspaceSnapshot | null, paneId: string): Pa
     }
   }
   return null;
+}
+
+// visiblePaneIDs collects every pane id rendered by a tab (all lanes, all
+// groups — including the collapsed members of a stack, which are on screen as
+// title bars). Used to tell "my focused pane is gone / on another tab" from
+// "the daemon simply moved its own focus somewhere else".
+function visiblePaneIDs(tab: TabSnapshot): Set<string> {
+  const ids = new Set<string>();
+  for (const lane of tab.lanes || []) {
+    for (const g of lane.pane_groups || []) {
+      for (const p of g.panes || []) ids.add(p.id);
+    }
+  }
+  return ids;
+}
+
+/**
+ * resolveFocus decides which pane THIS window focuses after a snapshot.
+ *
+ * Focus is client-owned here, not daemon-owned. The daemon moves
+ * `active_pane_id` for reasons that have nothing to do with the person at this
+ * keyboard: an agent spawns a pane, a background job finishes, another client
+ * clicks. Following those moves yanked the cursor out from under someone
+ * mid-sentence — you type into pane 1, an agent in pane 2 creates a child, and
+ * the rest of your line lands in pane 2. Every keystroke this app sends is
+ * addressed to an explicit pane id (see useKeyboard/PaneInput), so nothing
+ * requires the daemon and this window to agree on focus.
+ *
+ * So: the daemon's focus is adopted only when the user asked for a move here.
+ * Directional navigation (focus_pane_left, stacked_pane_next, focus_tab_index,
+ * create_pane …) can't be resolved client-side — only the daemon knows the
+ * layout well enough to say where "left" lands — so sendCommand arms a short
+ * follow window and the first daemon focus CHANGE inside it wins. A click needs
+ * no window: it names its pane outright.
+ */
+export function resolveFocus(
+  s: WorkspaceSnapshot,
+  focused: string | null,
+  followUntil: number,
+  now: number
+): { focusedPaneID: string | null; followDaemonUntil: number } {
+  const daemon = s.active_pane_id || '';
+  // Nothing focused yet (first snapshot, or after Detach): seed from the daemon.
+  if (!focused) return { focusedPaneID: daemon || null, followDaemonUntil: 0 };
+
+  const tab = (s.tabs || []).find((t) => t.id === s.active_tab_id) || (s.tabs || [])[0];
+  const visible = tab ? visiblePaneIDs(tab) : new Set<string>();
+  // The focused pane is not on screen — it was closed, or the visible tab
+  // changed. Either way it cannot take keystrokes, so the daemon's choice is
+  // the only sane answer.
+  //
+  // An EMPTY set means the snapshot carried no panes at all (a degraded or
+  // placeholder frame — a timed-out cascade leg). That is missing information,
+  // not evidence that the pane is gone, so it must not move focus.
+  if (visible.size > 0 && !visible.has(focused)) {
+    return { focusedPaneID: daemon || focused, followDaemonUntil: 0 };
+  }
+
+  // Armed by a user-issued focus-moving command. Adopt the first CHANGE and
+  // disarm; an unchanged id means the daemon hasn't acted yet, so keep waiting
+  // until the window lapses (rather than burning the arm on a stale frame).
+  if (followUntil > now && daemon && daemon !== focused) {
+    return { focusedPaneID: daemon, followDaemonUntil: 0 };
+  }
+
+  return { focusedPaneID: focused, followDaemonUntil: followUntil > now ? followUntil : 0 };
 }
 
 // paneCursor returns a pane's current VT cursor (raw or remote-interactive).
@@ -139,6 +205,15 @@ interface AppStore {
   snapshot: WorkspaceSnapshot | null;
   connected: boolean;
   pendingApproval: PendingApproval | null;
+  // The server refused an approval answer (approval_error). Held separately
+  // from pendingApproval because submitApproval clears the dialog optimistically
+  // — by the time a refusal arrives there is nothing left on screen to attach
+  // it to, and on a phone an unshown refusal is indistinguishable from success.
+  approvalError: string | null;
+  // The most recent clipboard_content reply. The component that asked keeps its
+  // request id and ignores anything else — replies are per-connection, and a
+  // second copy started elsewhere must not hijack the first one's sheet.
+  clipboardResult: ClipboardContent | null;
   ws: WebSocket | null;
 
   // Client-side UI state
@@ -155,9 +230,20 @@ interface AppStore {
   // command (PS2 continuation) until it completes and submits as one entry.
   panePendingCmd: Record<string, string>;
   fullscreenPaneID: string | null;
-  activePaneOverride: string | null;
-  /** When the pending override was set (ms). Bounds how long an unacked click holds the UI. */
-  activePaneOverrideAt: number;
+  /**
+   * The pane THIS window considers focused — client-owned, and the single
+   * source of truth for where keystrokes go and which pane draws the accent
+   * border. Only user intent moves it (a click, or a navigation command this
+   * window sent); daemon-side focus churn does not. null = not seeded yet, fall
+   * back to the daemon. See resolveFocus.
+   */
+  focusedPaneID: string | null;
+  /**
+   * While Date.now() < followDaemonUntil, the next daemon focus CHANGE is
+   * adopted. Armed by sendCommand for the commands whose landing pane only the
+   * daemon can compute (directional nav, stack rotation, tab switch, create).
+   */
+  followDaemonUntil: number;
   escCount: number;
   escTimer: ReturnType<typeof setTimeout> | null;
   renameText: string;
@@ -190,6 +276,12 @@ interface AppStore {
   // per pane, pushed by the server over /ws as webpane_frame / webpane_error.
   webPaneFrames: Record<string, WebPaneFrame>;
   webPaneErrors: Record<string, string>;
+
+  // Agents board (design 025 / 028), keyed by the pane rendering it. Keyed by
+  // PANE and not by board id because two panes can render the same board and
+  // one window can show several boards at once; the pane is what the answer is
+  // correlated back to.
+  boardData: Record<string, BoardData>;
 
   // Agent / Humanoid / Share panel data
   agentList: AgentInfo[];
@@ -299,6 +391,8 @@ interface AppStore {
   clearSession: () => void;
   setMode: (m: AppMode) => void;
   setPendingApproval: (a: PendingApproval | null) => void;
+  setApprovalError: (e: string | null) => void;
+  setClipboardResult: (c: ClipboardContent | null) => void;
   cycleInputMode: (paneId: string) => void;
   setInputMode: (paneId: string, mode: InputMode) => void;
   getInputMode: (paneId: string) => InputMode;
@@ -313,7 +407,10 @@ interface AppStore {
   // buffers via the pane_clear_output WS command).
   clearPaneOutput: (paneId: string) => void;
   setFullscreenPaneID: (id: string | null) => void;
-  setActivePaneOverride: (id: string | null) => void;
+  /** Explicit user focus (a click, or a tap/select in the mobile UI). */
+  focusPane: (id: string | null) => void;
+  /** Arm the follow window: let the daemon's next focus change through. */
+  armFocusFollow: () => void;
   setEscCount: (count: number) => void;
   setEscTimer: (timer: ReturnType<typeof setTimeout> | null) => void;
   setRenameText: (text: string) => void;
@@ -371,6 +468,7 @@ interface AppStore {
   setWebPaneStatus: (status: WebPaneStatus) => void;
   setWebEnv: (env: WebEnv | null) => void;
   setWebPaneFrame: (frame: WebPaneFrame) => void;
+  setBoardData: (data: BoardData) => void;
   setWebPaneError: (paneId: string, error: string) => void;
   setWebBinding: (paneId: string, profile: string, url: string) => void;
   clearWebBinding: (paneId: string) => void;
@@ -383,19 +481,19 @@ interface AppStore {
   getEffectiveActivePaneID: () => string;
 }
 
-// A click override is a bet that the daemon will confirm the focus command we
-// just sent. PaneBox re-sends at 2.5s; this is the backstop for the case where
-// the command is never acted on at all (daemon busy, command dropped), so the
-// UI cannot wedge on a pane the daemon does not agree is focused.
-//
-// Comfortably longer than the re-send so a slow-but-working ack still wins.
-const ACTIVE_PANE_OVERRIDE_TTL_MS = 6000;
+// How long a user-issued focus-moving command waits for the daemon to report
+// where focus landed. Long enough to survive a daemon busy with PTY churn,
+// short enough that an agent creating a pane a moment later is not mistaken for
+// the answer to the arrow key you pressed.
+export const FOCUS_FOLLOW_WINDOW_MS = 3000;
 
 export const useStore = create<AppStore>((set, get) => ({
   // Initial state
   snapshot: null,
   connected: false,
   pendingApproval: null,
+  approvalError: null,
+  clipboardResult: null,
   ws: null,
   mode: 'normal',
   paneInputModes: {},
@@ -406,8 +504,8 @@ export const useStore = create<AppStore>((set, get) => ({
   paneHistoryPrefix: {},
   panePendingCmd: {},
   fullscreenPaneID: null,
-  activePaneOverride: null,
-  activePaneOverrideAt: 0,
+  focusedPaneID: null,
+  followDaemonUntil: 0,
   paneHistory: {},
   escCount: 0,
   escTimer: null,
@@ -421,6 +519,7 @@ export const useStore = create<AppStore>((set, get) => ({
   webEnv: null,
   webPaneFrames: {},
   webPaneErrors: {},
+  boardData: {},
   agentList: [],
   humanoidList: [],
   controlEnabled: false,
@@ -459,7 +558,7 @@ export const useStore = create<AppStore>((set, get) => ({
 
   // Actions
   setSnapshot: (s, layoutOnly) => {
-    const { activePaneOverride, activePaneOverrideAt, paneEcho, paneContent: prevContent, paneVT: prevVT, paneInputModes } = get();
+    const { focusedPaneID, followDaemonUntil, paneEcho, paneContent: prevContent, paneVT: prevVT, paneInputModes } = get();
     // A full snapshot (re)seeds the per-pane content/VT store; a layout-only one
     // keeps it (content arrives via pane_output / pane_vt deltas).
     let paneContent = prevContent;
@@ -563,38 +662,18 @@ export const useStore = create<AppStore>((set, get) => ({
       }
     }
 
+    // Focus never simply mirrors s.active_pane_id — see resolveFocus for why
+    // the daemon does not get to move this window's cursor on its own.
+    const focus = resolveFocus(s, focusedPaneID, followDaemonUntil, Date.now());
+
     set({
       snapshot: s,
       paneContent,
       paneVT,
       paneEcho: nextEcho,
       paneInputModes: nextModes,
-      // Clear the override when the daemon ACKS it, and otherwise leave it
-      // alone until ACTIVE_PANE_OVERRIDE_TTL_MS has passed.
-      //
-      // It used to also clear whenever the daemon moved focus anywhere else,
-      // on the theory that such a move was the user doing something newer.
-      // That is false for the move that matters most: creating a pane focuses
-      // the new pane, so with many panes spawning children — 22 claude panes
-      // each starting another — a creation landing between a click and its ack
-      // discarded the click. Focus then sat on whichever pane had most
-      // recently been created, and PaneBox's 2.5s re-send could not rescue it
-      // because the override it re-sends had already been cleared.
-      //
-      // The cases that rule DID protect — ctrl+p s stack rotation, arrow-key
-      // navigation, focus_tab_index — are all commands this app sends, so they
-      // now clear the override at the point of sending (see
-      // FOCUS_MOVING_ACTIONS in utils/commands.ts). That distinction is the
-      // whole point: a newer USER intent supersedes a click; background churn
-      // does not.
-      activePaneOverride: !activePaneOverride
-        ? null
-        : s.active_pane_id === activePaneOverride
-          ? null // acked
-          : activePaneOverrideAt > 0 &&
-              Date.now() - activePaneOverrideAt > ACTIVE_PANE_OVERRIDE_TTL_MS
-            ? null // never acked — do not wedge the UI on a lost command
-            : activePaneOverride,
+      focusedPaneID: focus.focusedPaneID,
+      followDaemonUntil: focus.followDaemonUntil,
     });
   },
 
@@ -611,10 +690,21 @@ export const useStore = create<AppStore>((set, get) => ({
     }
     // sidecarPort = null stops useWebSocket from reconnecting to the detached
     // daemon; it resumes automatically when a workspace is opened (port set).
-    set({ snapshot: null, connected: false, ws: null, sidecarPort: null });
+    set({
+      snapshot: null,
+      connected: false,
+      ws: null,
+      sidecarPort: null,
+      // The focused pane belonged to the session we just dropped; the next
+      // session seeds focus from its own first snapshot.
+      focusedPaneID: null,
+      followDaemonUntil: 0,
+    });
   },
   setMode: (m) => set({ mode: m }),
   setPendingApproval: (a) => set({ pendingApproval: a }),
+  setApprovalError: (e) => set({ approvalError: e }),
+  setClipboardResult: (c) => set({ clipboardResult: c }),
 
   cycleInputMode: (paneId) =>
     set((state) => {
@@ -703,8 +793,11 @@ export const useStore = create<AppStore>((set, get) => ({
 
   setFullscreenPaneID: (id) => set({ fullscreenPaneID: id }),
 
-  setActivePaneOverride: (id) =>
-    set({ activePaneOverride: id, activePaneOverrideAt: id ? Date.now() : 0 }),
+  // A click names its pane, so it lands immediately and closes any armed
+  // follow window — a click is newer intent than the arrow key before it.
+  focusPane: (id) => set({ focusedPaneID: id, followDaemonUntil: 0 }),
+
+  armFocusFollow: () => set({ followDaemonUntil: Date.now() + FOCUS_FOLLOW_WINDOW_MS }),
 
   setEscCount: (count) => set({ escCount: count }),
   setEscTimer: (timer) => set({ escTimer: timer }),
@@ -1020,6 +1113,13 @@ export const useStore = create<AppStore>((set, get) => ({
 
   setWebEnv: (env) => set({ webEnv: env }),
 
+  // Whole-value replace, deliberately: a board_result is a complete answer for
+  // that pane, and an error result must be able to REPLACE a previous good one.
+  // Merging the two would leave last good threads sitting under a "recorder is
+  // not answering" banner, which reads as live data that is anything but.
+  setBoardData: (data) =>
+    set((state) => ({ boardData: { ...state.boardData, [data.paneId]: data } })),
+
   setWebPaneFrame: (frame) =>
     set((state) => {
       // A fresh frame supersedes any earlier error for the pane.
@@ -1062,8 +1162,8 @@ export const useStore = create<AppStore>((set, get) => ({
   setWorkspace: (path, name) => set({ workspacePath: path, workspaceName: name }),
 
   getEffectiveActivePaneID: () => {
-    const { activePaneOverride, snapshot } = get();
-    if (activePaneOverride) return activePaneOverride;
+    const { focusedPaneID, snapshot } = get();
+    if (focusedPaneID) return focusedPaneID;
     return snapshot?.active_pane_id || '';
   },
 }));

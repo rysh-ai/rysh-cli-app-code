@@ -77,7 +77,13 @@ export function SharePanel() {
   // submit_input on the active pane (the daemon handles the `##` prefix and
   // prints results to the pane's rysh output).
   function runUpstream(text: string) {
-    sendCommand('submit_input', { text, mode: 'rysh' });
+    // pane_id: the pane the user sees focused, which is this window's own state
+    // and no longer necessarily the daemon's active pane (see resolveFocus).
+    sendCommand('submit_input', {
+      text,
+      mode: 'rysh',
+      pane_id: useStore.getState().getEffectiveActivePaneID(),
+    });
   }
   function subscribe() {
     const id = subscribeId.trim();

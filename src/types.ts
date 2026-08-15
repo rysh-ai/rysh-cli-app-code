@@ -9,6 +9,12 @@ export interface WorkspaceSnapshot {
   // these (or list a single entry).
   workspaces?: string[];
   active_workspace?: number;
+  // Tab-bar orientation (rysh-cli 408a9a8): true renders the tab bar as a
+  // column down the left edge of the body instead of a strip in the header.
+  // Per-workspace, set by `##tab orientation` / ctrl+t v / the header's ▤
+  // button, and persisted with the layout. Omitted when horizontal, so an
+  // older daemon (or a fresh workspace) reads as the horizontal default.
+  tab_bar_vertical?: boolean;
 }
 
 export interface TabSnapshot {
@@ -80,6 +86,10 @@ export interface PaneSnapshot {
   mode_outputs?: Record<string, string>;
   external_history?: string[];
   pane_type?: string;
+  // Free-form pane metadata the daemon has always sent and this client never
+  // declared. `board.id` names which board an agents-board pane renders
+  // (design 028); fleet.name / fleet.role / epic identify a fleet member.
+  meta?: Record<string, string>;
   shell_pid?: number; // OS pid of the pane's shell, used to resolve cwd for tab-completion
   // Live shell cwd as reported via OSC 7 (push-based, exact after every
   // prompt). Preferred over shell_pid+lsof resolution when non-empty.
@@ -355,6 +365,95 @@ export interface WebPaneFrame {
   url: string;
   title: string;
   screenshot: string; // base64 JPEG
+  // The browser viewport the screenshot was taken at. Forwarded input must be
+  // hit-tested against these, not the displayed <img> size. 0 when the server
+  // could not determine a size — do not divide by them unchecked.
+  sourceWidth: number;
+  sourceHeight: number;
+}
+
+// ── Agents board (design 025 / 028) ──
+//
+// An agents-board pane is SHELL-LESS: it never starts a shell, so it has no
+// output buffer and no VT screen, and `pane.output` for one holds whatever
+// stale text happens to be there. Its content is fetched instead, with a
+// `board_get` this client sends and a `board_result` the server answers only
+// this client with (internal/web/board.go).
+
+/** One post on the board: a thread root, or a reply under one. */
+export interface BoardPost {
+  /** Full pane uuid of the poster. THE identity — persona is not unique. */
+  pane_id: string;
+  /** Display name only; two panes in different lanes may share one. */
+  persona: string;
+  kind: string; // free-form: milestone, task-done, blocked, reply, or an agent's own
+  text: string;
+  thread_id?: string;
+  ts: number; // unix millis, the POSTER's clock — arrival order, not causal order
+  to_persona?: string;
+  to_pane_id?: string;
+}
+
+export interface BoardThread {
+  key: string;
+  /** null while the thread is provisional (replies arrived before their root). */
+  root: BoardPost | null;
+  replies: BoardPost[] | null;
+  provisional: boolean;
+}
+
+export interface BoardRosterEntry {
+  pane_id: string;
+  persona: string;
+  ts: number;
+}
+
+export interface BoardStats {
+  threads: number;
+  provisional: number;
+  posts: number;
+  duplicates: number;
+  evicted: number;
+  unknown_version: number;
+}
+
+/**
+ * BoardData is one board_result: either an answer or a REFUSAL, never both.
+ *
+ * `error` and `threads` are mutually exclusive by construction on the server,
+ * and the view must keep them that way. An unanswered query rendered as an
+ * empty thread list would show a clean, confident, empty board — which is
+ * exactly what a quiet fleet looks like, so the operator could not tell a
+ * silent fleet from a recorder that has stopped answering.
+ */
+export interface BoardData {
+  paneId: string;
+  board: string;
+  threads?: BoardThread[];
+  roster?: BoardRosterEntry[];
+  stats?: BoardStats;
+  /** Threads dropped by `since` / by `limit` — so a window can say it is one. */
+  filtered?: number;
+  withheld?: number;
+  /** False ⇒ the roster may list panes that have since closed (F-26). */
+  roster_reconciled?: boolean;
+  error?: string;
+  /** The recorder did not answer, as opposed to a bug in the request. */
+  no_recorder?: boolean;
+  /** Client clock, for "as of" — the board itself carries no fetch time. */
+  fetchedAt: number;
+}
+
+// ClipboardContent is the reply to a clipboard_copy (protocol §2.8), sent to
+// the ASKING client only — a pane buffer holds whatever that pane printed, so
+// broadcasting one viewer's copy to every client would leak it.
+export interface ClipboardContent {
+  requestId: string; // echoed from the request; correlate on it
+  paneId: string;
+  source: string; // the buffer actually read, with the default resolved
+  text: string;
+  truncated: boolean; // true when text is the TAIL of a larger buffer
+  err: string; // empty on success; set instead of failing silently
 }
 
 /**

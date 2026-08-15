@@ -2,6 +2,14 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { useStore, findPane } from '../store';
 import { sendCommand } from '../utils/commands';
 import { BrowserAgentChat } from './BrowserAgentChat';
+import {
+  MOVE_THROTTLE_MS,
+  buttonName,
+  isForwardableKey,
+  isMuxChord,
+  modifiersOf,
+  pointerAt,
+} from '../utils/webPaneInput';
 
 interface Props {
   paneId: string;
@@ -281,6 +289,105 @@ function ServerWebPaneView({
     [paneId]
   );
 
+  // ── Driving the page (E-16) ───────────────────────────────────────────────
+  // The frame is a picture of a LIVE page, so pointer and key events go back
+  // over /ws as `webpane_input`; the server replays them into the headless
+  // browser and answers with a fresh frame. The client scales nothing — it
+  // reports the point in the rendered image's own space plus that image's
+  // measured size, and the server maps into source space (utils/webPaneInput).
+  const imgRef = useRef<HTMLImageElement>(null);
+  const lastMoveRef = useRef(0);
+  const showsFrame = !error && !!frame?.screenshot;
+
+  const sendPointer = useCallback(
+    (
+      kind: 'click' | 'scroll' | 'move',
+      e: { clientX: number; clientY: number },
+      extra?: Record<string, unknown>
+    ): boolean => {
+      const el = imgRef.current;
+      if (!el) return false;
+      const params = pointerAt(paneId, kind, e, el.getBoundingClientRect());
+      if (!params) return false;
+      sendCommand('webpane_input', { ...params, ...extra });
+      return true;
+    },
+    [paneId]
+  );
+
+  const handleClick = useCallback(
+    (e: React.MouseEvent<HTMLImageElement>) => {
+      // Focus the frame itself so the NEXT keystroke has somewhere to land.
+      // (Click still bubbles: the pane grid focuses the pane on the same click.)
+      imgRef.current?.focus();
+      sendPointer('click', e, { button: buttonName(e.button), modifiers: modifiersOf(e) });
+    },
+    [sendPointer]
+  );
+
+  const handleAuxClick = useCallback(
+    (e: React.MouseEvent<HTMLImageElement>) => {
+      // Right-click arrives here too; onContextMenu owns it (it also has to
+      // suppress the local menu), so only the middle button is handled here.
+      if (e.button !== 1) return;
+      e.preventDefault();
+      sendPointer('click', e, { button: 'middle', modifiers: modifiersOf(e) });
+    },
+    [sendPointer]
+  );
+
+  const handleContextMenu = useCallback(
+    (e: React.MouseEvent<HTMLImageElement>) => {
+      // The page's own context menu, not this browser's menu for an image.
+      e.preventDefault();
+      imgRef.current?.focus();
+      sendPointer('click', e, { button: 'right', modifiers: modifiersOf(e) });
+    },
+    [sendPointer]
+  );
+
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent<HTMLImageElement>) => {
+      const now = Date.now();
+      if (now - lastMoveRef.current < MOVE_THROTTLE_MS) return;
+      if (sendPointer('move', e)) lastMoveRef.current = now;
+    },
+    [sendPointer]
+  );
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLImageElement>) => {
+      // The multiplexer chords stay with the multiplexer — a surface that
+      // swallows the whole keyboard has no way back out (mirrors PaneBox's
+      // treatment of an interactive PTY).
+      if (isMuxChord(e)) return;
+      if (!isForwardableKey(e.key)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      sendCommand('webpane_input', {
+        pane_id: paneId,
+        kind: 'key',
+        key: e.key,
+        modifiers: modifiersOf(e),
+      });
+    },
+    [paneId]
+  );
+
+  useEffect(() => {
+    const el = imgRef.current;
+    if (!el || !showsFrame) return;
+    // Wheel is bound natively and non-passive on purpose: React registers its
+    // root wheel listener as passive, where preventDefault is a silent no-op —
+    // the pane would scroll its own container while the page never moved.
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      sendPointer('scroll', e, { delta_x: e.deltaX, delta_y: e.deltaY });
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [showsFrame, sendPointer]);
+
   if (!available) {
     return (
       <div className="flex-1 flex items-center justify-center text-[#666] p-5 text-center">
@@ -347,10 +454,18 @@ function ServerWebPaneView({
           <div className="p-5 text-center text-[13px] text-[#ff8787] max-w-[560px]">{error}</div>
         ) : frame?.screenshot ? (
           <img
+            ref={imgRef}
             src={`data:image/jpeg;base64,${frame.screenshot}`}
             alt={frame.title || 'server-side web pane'}
-            className="max-w-full h-auto"
+            className="max-w-full h-auto outline-none"
             draggable={false}
+            tabIndex={0}
+            title="Click to focus, then type — input is forwarded to the page"
+            onClick={handleClick}
+            onAuxClick={handleAuxClick}
+            onContextMenu={handleContextMenu}
+            onMouseMove={handleMouseMove}
+            onKeyDown={handleKeyDown}
           />
         ) : (
           <div className="p-5 text-[13px] text-[#666]">starting server-side browser…</div>

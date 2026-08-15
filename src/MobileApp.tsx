@@ -3,6 +3,8 @@ import { useWebSocket } from './hooks/useWebSocket';
 import { useVisualViewport } from './hooks/useVisualViewport';
 import { ModeTabBar } from './components/ModeTabBar';
 import { FileBrowser } from './components/FileBrowser';
+import { ApprovalOverlay } from './components/ApprovalOverlay';
+import { PaneCopyButton } from './components/PaneCopyButton';
 import { useStore } from './store';
 import { sendCommand } from './utils/commands';
 import { PaneBox } from './components/PaneBox';
@@ -132,6 +134,21 @@ function Row({
 }
 
 export default function MobileApp() {
+  return (
+    <>
+      <MobileScreens />
+      {/* A gated tool blocks the agent until someone answers it, and the phone
+          is often the surface that is actually to hand. The overlay sits
+          OUTSIDE the drill-down so an approval is answerable from the tab list
+          or the pane list — not only after navigating to the pane that raised
+          it, which is a request nobody answers. Same component the desktop
+          mounts (App.tsx), so both surfaces answer through one path. */}
+      <ApprovalOverlay />
+    </>
+  );
+}
+
+function MobileScreens() {
   useWebSocket();
 
   const snapshot = useStore((s) => s.snapshot);
@@ -187,6 +204,10 @@ export default function MobileApp() {
     const idx = tabs.findIndex((x) => x.id === selectedTabId);
     if (idx >= 0) sendCommand('focus_tab_index', { index: idx });
     sendCommand('focus_pane_by_id', { id: paneId });
+    // Tapping a pane names it outright, so claim focus here rather than waiting
+    // on the daemon — and last, so it also closes the follow window that
+    // focus_tab_index just armed (this tap is the newer, more specific intent).
+    useStore.getState().focusPane(paneId);
     setSelectedPaneId(paneId);
     setShowFiles(false);
     setView('pane');
@@ -221,14 +242,19 @@ export default function MobileApp() {
           connected={connected}
           actions={
             found ? (
-              <button
-                type="button"
-                onClick={() => setShowFiles(true)}
-                className="text-[18px] px-1.5 py-0.5 rounded bg-[#333] border border-[#555] active:bg-[#444]"
-                aria-label="Browse files"
-              >
-                📁
-              </button>
+              <>
+                {/* Out of the pane, onto this device — the direction a phone
+                    cannot get any other way (no mouse selection, no scrollback). */}
+                <PaneCopyButton pane={found} inputMode={getInputMode(found.id)} />
+                <button
+                  type="button"
+                  onClick={() => setShowFiles(true)}
+                  className="text-[18px] px-1.5 py-0.5 rounded bg-[#333] border border-[#555] active:bg-[#444]"
+                  aria-label="Browse files"
+                >
+                  📁
+                </button>
+              </>
             ) : undefined
           }
         />
@@ -293,7 +319,7 @@ export default function MobileApp() {
                   return (
                     <Row
                       key={p.id}
-                      active={p.id === snapshot.active_pane_id}
+                      active={p.id === effectiveActiveID}
                       activeColor="bg-[#00d75f]"
                       title={paneLabel(p)}
                       subtitle={`${modeLabel(getInputMode(p.id))} · ${p.status || 'idle'}`}

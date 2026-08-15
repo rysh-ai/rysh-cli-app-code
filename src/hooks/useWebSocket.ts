@@ -126,6 +126,29 @@ export function useWebSocket() {
               // over the same socket; correlated by request_id).
               resolveCompletionResult(msg.data || {});
               break;
+            case 'board_result': {
+              // The agents board (design 025/028): the answer to a board_get
+              // this client sent, for one shell-less board pane. Stored as it
+              // arrived — error and threads are mutually exclusive and the view
+              // renders whichever came, so nothing is normalised away here.
+              const d = msg.data;
+              if (d?.pane_id) {
+                store.setBoardData({
+                  paneId: d.pane_id,
+                  board: d.board || '',
+                  threads: d.threads,
+                  roster: d.roster,
+                  stats: d.stats,
+                  filtered: d.filtered,
+                  withheld: d.withheld,
+                  roster_reconciled: d.roster_reconciled,
+                  error: d.error,
+                  no_recorder: d.no_recorder,
+                  fetchedAt: Date.now(),
+                });
+              }
+              break;
+            }
             case 'webpane_frame':
               // W12: a server-driven web pane pushed a fresh frame (url/title +
               // JPEG screenshot) for browser-mode rendering.
@@ -135,6 +158,8 @@ export function useWebSocket() {
                   url: msg.data.url || '',
                   title: msg.data.title || '',
                   screenshot: msg.data.screenshot || '',
+                  sourceWidth: msg.data.source_width || 0,
+                  sourceHeight: msg.data.source_height || 0,
                 });
               }
               break;
@@ -147,7 +172,28 @@ export function useWebSocket() {
               break;
             case 'approval_request':
               store.setPendingApproval(msg.data);
+              store.setApprovalError(null);
               store.setMode('approval');
+              break;
+            case 'clipboard_content':
+              // Reply to this client's clipboard_copy (§2.8) — targeted, not a
+              // broadcast. The asking component correlates on request_id and
+              // ignores anything that is not its own.
+              store.setClipboardResult({
+                requestId: msg.data?.request_id || '',
+                paneId: msg.data?.pane_id || '',
+                source: msg.data?.source || '',
+                text: msg.data?.text || '',
+                truncated: !!msg.data?.truncated,
+                err: msg.data?.err || '',
+              });
+              break;
+            case 'approval_error':
+              // The server refused an answer (malformed, no pane_id, or a
+              // decision it does not recognise). Fail-visible: submitApproval
+              // has already closed the dialog, so without this the phone shows
+              // "answered" while the tool stays blocked to its timeout.
+              store.setApprovalError(msg.data?.error || 'the approval was not delivered');
               break;
             case 'agent_list':
               store.setAgentList(msg.data || []);

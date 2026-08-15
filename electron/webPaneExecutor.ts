@@ -129,6 +129,17 @@ export async function executeBrowserAction(
   action: string,
   params: Record<string, any>,
 ): Promise<BrowserActionResult> {
+  // Trusted input is routed by webContents focus, so typeTrusted / pressKeyTrusted
+  // / pasteTrusted have to call wc.focus() on the page they drive. That is a
+  // background pane taking the keyboard out from under the user — the same
+  // complaint as pane focus stealing, one layer down: an agent typing into a web
+  // pane swallowed the words you were typing into a terminal pane. If the
+  // renderer held focus when the action started, hand it straight back when the
+  // action ends. If it did not (the user is working inside the page itself),
+  // leave focus where the user put it.
+  const host = manager.getHostWebContents()
+  const restoreHost = !!host && !host.isDestroyed() && host.isFocused()
+
   try {
     if (RESOLVER_ACTIONS.has(action)) {
       // Inject the selector resolver (idempotent). Failures are non-fatal: the
@@ -165,6 +176,10 @@ export async function executeBrowserAction(
     }
   } catch (err: any) {
     return { success: false, error: err?.message || String(err) }
+  } finally {
+    if (restoreHost && host && !host.isDestroyed() && !host.isFocused()) {
+      host.focus()
+    }
   }
 }
 

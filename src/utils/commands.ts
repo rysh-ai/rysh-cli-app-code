@@ -3,38 +3,53 @@ import { useStore } from '../store';
 /**
  * Send a command to the Go server via WebSocket.
  */
-// Focus-moving commands, by action name. Issuing any of them is a NEWER
-// statement of where the user wants focus, so it supersedes a pending click
-// override — see clearing rules in store.setSnapshot.
+// Commands whose landing pane only the daemon can work out. "Left" and "next
+// in the stack" depend on a layout this window does not model, and creating a
+// pane invents an id the daemon alone knows — so these ask the daemon where
+// focus went and adopt its answer (store.armFocusFollow + resolveFocus).
 //
-// focus_pane_by_id is absent on purpose: that IS the click, and PaneBox sets
-// the override alongside it (and re-sends it after 2.5s).
-const FOCUS_MOVING_ACTIONS = new Set([
+// Membership is the whole focus policy: an action listed here lets the daemon
+// move this window's cursor once, and everything NOT listed here — an agent
+// spawning a pane, a background job finishing, another client clicking — is
+// ignored. That is what keeps you typing in pane 1 while pane 2 works.
+//
+// focus_pane_by_id is absent on purpose: that IS the click, and the caller has
+// already named the pane locally via store.focusPane — there is nothing to wait
+// for.
+const FOCUS_ADOPTING_ACTIONS = new Set([
+  // directional / cyclic pane navigation
   'focus_pane_left',
   'focus_pane_right',
   'focus_pane_up',
   'focus_pane_down',
   'focus_next_pane',
   'focus_prev_pane',
+  // tab navigation — a new tab shows a different pane
   'focus_next_tab',
   'focus_prev_tab',
   'focus_tab_index',
+  'create_tab',
+  'move_tab',
+  // stack rotation
   'stacked_pane_next',
   'stacked_pane_prev',
   'stacked_pane_select',
+  'stacked_pane_move',
   'swap_pane',
+  // structural changes the user asked for: the daemon focuses the pane it just
+  // made, and focuses a survivor when one closes
+  'create_pane',
+  'create_pane_down',
+  'create_stacked_pane',
+  'close_pane',
+  'switch_workspace',
 ]);
 
 export function sendCommand(action: string, params?: Record<string, unknown>): void {
   const ws = useStore.getState().ws;
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  // Keyboard navigation and stack rotation move focus deliberately. Drop any
-  // pending click override here rather than inferring it from the snapshot:
-  // the store can no longer tell "the daemon moved focus for its own reasons"
-  // (a pane being created, which must NOT cancel a click) from "the user asked
-  // for a different pane" (which must).
-  if (FOCUS_MOVING_ACTIONS.has(action) && useStore.getState().activePaneOverride) {
-    useStore.getState().setActivePaneOverride(null);
+  if (FOCUS_ADOPTING_ACTIONS.has(action)) {
+    useStore.getState().armFocusFollow();
   }
   ws.send(
     JSON.stringify({

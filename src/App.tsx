@@ -6,6 +6,7 @@ import { useWebBridge } from './hooks/useWebBridge';
 import { useClipboard } from './hooks/useClipboard';
 import { useStore } from './store';
 import { Header } from './components/Header';
+import { TabBar, useTabBarVertical } from './components/TabBar';
 import { Body } from './components/Body';
 import { Footer } from './components/Footer';
 import { ModeOverlay } from './components/ModeOverlay';
@@ -34,6 +35,13 @@ export default function App() {
   const workspacePath = useStore((s) => s.workspacePath);
   const showWelcome = !!window.electronAPI && !workspacePath;
 
+  // Vertical tab bar (rysh-cli 408a9a8): the tab strip leaves the header and
+  // becomes a column on the left edge of the body. It sits INSIDE the body row
+  // rather than beside <Header>, so the panes' measured width — which is what
+  // usePaneResize claims as the PTY size and what WebPaneView hands the native
+  // web views as bounds — shrinks by the column automatically.
+  const tabBarVertical = useTabBarVertical();
+
   // GC native web views: a WebContentsView is kept alive only while its pane
   // still has web enabled (a profile bound). Cycling input modes preserves the
   // binding (and the live page), so cycling web→shell→…→web re-attaches the same
@@ -58,7 +66,8 @@ export default function App() {
     <div id="app" className="flex flex-col h-screen w-screen">
       <Header />
       <div className="flex-1 flex overflow-hidden relative">
-        <div className="flex-1 flex flex-col overflow-hidden">
+        {tabBarVertical && <TabBar orientation="vertical" />}
+        <div className="flex-1 flex flex-col overflow-hidden min-w-0">
           <Body />
         </div>
         {showAgentPanel && <AgentPanel />}

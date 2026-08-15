@@ -302,6 +302,15 @@ export class WebPaneManager {
   }
 
   /**
+   * The host window's own webContents — the renderer drawing the pane grid, as
+   * opposed to any embedded page. Used to give the keyboard back after an
+   * agent-driven browser action had to focus a page to inject trusted input.
+   */
+  getHostWebContents(): Electron.WebContents | null {
+    return this.window?.webContents ?? null
+  }
+
+  /**
    * Register a callback to receive web pane status updates.
    */
   onStatusUpdate(callback: (status: WebPaneStatus) => void): void {

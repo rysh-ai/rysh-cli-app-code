@@ -8,6 +8,7 @@ import { ConversationOutput } from './ConversationOutput';
 import { WebPaneView } from './WebPaneView';
 import { EmailClientView } from './EmailClientView';
 import { WhatsAppClientView } from './WhatsAppClientView';
+import { AgentsBoardView } from './AgentsBoardView';
 import { TouchTermInput, type TermEcho } from './TouchTermInput';
 import { TouchKeyMenu } from './TouchKeyMenu';
 import { usePaneResize } from '../hooks/usePaneResize';
@@ -251,7 +252,7 @@ export const PaneBox = React.memo(function PaneBox({
   conversationMessages,
   laneName,
 }: Props) {
-  const setActivePaneOverride = useStore((s) => s.setActivePaneOverride);
+  const focusPane = useStore((s) => s.focusPane);
   const setFullscreenPaneID = useStore((s) => s.setFullscreenPaneID);
   const echo = useStore((s) => s.paneEcho[pane.id]);
 
@@ -270,6 +271,12 @@ export const PaneBox = React.memo(function PaneBox({
   }, [isHumanoidMode, humanoidInfo]);
   const isEmailHumanoid = !!humanoidInfo?.channels?.some((c) => c.type === 'email');
   const isWhatsAppHumanoid = !!humanoidInfo?.channels?.some((c) => c.type === 'whatsapp');
+  // Agents board (design 025/028). The board id is forwarded to the server
+  // VERBATIM and resolved there (msg.BoardIDFromMeta), so this client and the
+  // terminal UI cannot end up showing different boards for one pane — the empty
+  // and invalid cases are decided in one place, in Go.
+  const isAgentsBoard = pane.pane_type === 'agents-board';
+  const boardId = pane.meta?.['board.id'] || '';
   // Insert-mode signal (mirrors rysh-cli dec4b7e): tint the active pane's accent
   // green while keystrokes land in the pane (normal mode — typing into PaneInput
   // or a raw/interactive pane), and keep the cyan accent during the multiplexer's
@@ -291,23 +298,23 @@ export const PaneBox = React.memo(function PaneBox({
     (e: React.MouseEvent) => {
       if ((e.target as HTMLElement).tagName === 'INPUT') return;
       if (e.button !== 0) return;
-      setActivePaneOverride(pane.id);
+      // The click IS the focus: this window switches immediately and does not
+      // wait for the daemon to agree. The command below only keeps the daemon's
+      // own idea of focus in step (for other clients, and for anything the
+      // daemon routes to its active pane).
+      focusPane(pane.id);
       sendCommand('focus_pane_by_id', { id: pane.id });
-      // If the daemon hasn't confirmed within 2.5s (its snapshot pushes can
-      // starve under heavy PTY churn — e.g. a claude CLI redraw storm),
-      // RE-SEND the focus command and KEEP the override. The old behavior
-      // (clearing the override) reverted the app to the STALE snapshot's
-      // active pane — the churning pane — which read as "the claude pane
-      // steals focus and my typing goes there". setSnapshot clears the
-      // override the moment the daemon confirms this pane or moves focus
-      // somewhere else on its own, so the override cannot wedge.
+      // The daemon's snapshot pushes can starve under heavy PTY churn (a claude
+      // CLI redraw storm), so re-send once if it still disagrees. Purely a
+      // daemon-side nudge now — this window's focus is already correct.
       setTimeout(() => {
-        if (useStore.getState().activePaneOverride === pane.id) {
+        const st = useStore.getState();
+        if (st.focusedPaneID === pane.id && st.snapshot?.active_pane_id !== pane.id) {
           sendCommand('focus_pane_by_id', { id: pane.id });
         }
       }, 2500);
     },
-    [pane.id, setActivePaneOverride]
+    [pane.id, focusPane]
   );
 
   // Native (##native) pass-through: hold the first Esc briefly awaiting the
@@ -641,12 +648,20 @@ export const PaneBox = React.memo(function PaneBox({
   }
 
   // ── Expanded pane: full rendering ──
+  // z-40 (not the `z-100` this used to carry — Tailwind v3's z scale stops at
+  // 50, so that class generated NO css and the maximized pane fell back to
+  // z-index:auto). It has to beat the header strip, which is `relative z-20`
+  // whenever the tab bar is vertical and therefore painted OVER the top 30px of
+  // a "full screen" pane. It must stay UNDER the right-edge drawers (agent /
+  // humanoid / share panels, z-50) and the overlays above them (mode 150,
+  // connection 200, dashboard 210, approval 300), which are meant to sit on top
+  // of whatever is maximized.
   return (
     <div
       data-pane-id={pane.id}
       onMouseDown={handleMouseDown}
       className={`flex flex-col border rounded-lg overflow-hidden min-h-[80px] flex-1 bg-[#1e1e1e] transition-[border-color] duration-150 cursor-default ${borderClass} ${
-        isFullscreen ? `fixed inset-0 z-100 rounded-none border-2 ${activeAccentBorder}` : ''
+        isFullscreen ? `fixed inset-0 z-40 rounded-none border-2 ${activeAccentBorder}` : ''
       }`}
     >
       {/* Title bar */}
@@ -680,6 +695,11 @@ export const PaneBox = React.memo(function PaneBox({
           {pane.pane_type === 'approval' && (
             <span className="bg-[#5f5f00] text-[#ffff87] px-1 rounded text-[10px] whitespace-nowrap">
               APPROVAL
+            </span>
+          )}
+          {isAgentsBoard && (
+            <span className="bg-[#5f005f] text-[#ff87ff] px-1 rounded text-[10px] whitespace-nowrap">
+              BOARD
             </span>
           )}
           {pane.controlling_share_id && (
@@ -791,7 +811,16 @@ export const PaneBox = React.memo(function PaneBox({
             keyToBytes={(e) => keyToBytes(e, !!pane.app_cursor_keys)}
           />
         )}
-        {inputMode === 'web' ? (
+        {/* Agents board (design 025/028). Dispatched FIRST because none of the
+            branches below can apply: the pane type is shell-less, so there is
+            no PTY, no VT screen and no output buffer for them to read — and
+            `pane.output` for one of these holds stale text from whatever last
+            ran near it, which is what made this pane look broken rather than
+            unimplemented. Mirrors the TUI's own ordering in
+            model_view.go:buildPanePanel. */}
+        {isAgentsBoard ? (
+          <AgentsBoardView paneId={pane.id} boardId={boardId} />
+        ) : inputMode === 'web' ? (
           <WebPaneView paneId={pane.id} />
         ) : isEmailHumanoid ? (
           <EmailClientView paneId={pane.id} humanoidName={inputMode} />
@@ -825,7 +854,23 @@ export const PaneBox = React.memo(function PaneBox({
           raw-mode footer hint; once double-Esc cycles it to a rysh input mode we
           render the normal PaneInput so the user can type prompts/commands (the
           app keeps running and returns when cycled back to shell). */}
-      {showsLiveApp ? (
+      {isAgentsBoard ? (
+        // A board pane is SHELL-LESS, so PaneInput here would be a text field
+        // whose keystrokes have nothing to reach. Rendering the hint instead is
+        // the honest version of the same space — and it names the command that
+        // does work, which is the one thing an agent staring at a board it
+        // cannot post to actually needs (the lesson of rysh-cli 3ec4283, where
+        // the empty-board hint named a binary that did not exist).
+        //
+        // The TUI additionally offers a compose field that routes a prompt to
+        // the board claude. That is a separate surface with its own routing and
+        // refusal semantics; it is NOT stubbed here, because a compose box that
+        // silently dropped prompts would be this same defect wearing the fix's
+        // clothes.
+        <div className="px-2.5 py-1 border-t border-[#333] bg-[#1a1a1a] shrink-0 text-[#808080] text-[11px] select-none">
+          read-only view · agents post with <code className="text-[#87d7af]">rysh board post &lt;text&gt;</code>
+        </div>
+      ) : showsLiveApp ? (
         // On touch devices the footer doubles as the "input field": tapping it
         // (like tapping the screen) focuses the hidden textarea so the soft
         // keyboard comes up — the esc/ctrl hints are useless on a phone.

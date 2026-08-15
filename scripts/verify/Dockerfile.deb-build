@@ -1,0 +1,47 @@
+# Packages the Linux .deb on Linux, so the artifact under test is a real one.
+#
+# WHY IT CANNOT BE BUILT ON THE MAC DIRECTLY
+# `make package-linux` on macOS produces a CORRUPT .deb and exits 0.
+# electron-builder shells out to `ar`; macOS supplies BSD ar; the result is a
+# 96-byte archive holding nothing but a symbol table (`ar t` prints
+# "__.SYMDEF SORTED"). It carries the exact filename of the real artifact.
+# CI never hit this because its linux job runs on ubuntu-latest.
+#
+# WHY THIS IMAGE IS NOT linux/amd64
+# The obvious move is an emulated amd64 container, matching CI's runner. It does
+# not work on Apple Silicon: Node crashes under QEMU user-mode emulation.
+# Measured on this box (M1, Docker 20.10.8, 2026-08-13):
+#   docker run --platform linux/amd64 node:20-bookworm-slim \
+#     npm install -g electron-builder@25.1.8
+#     -> "Trace/breakpoint trap", exit 133 (SIGTRAP)
+#   docker run --platform linux/amd64 node:20-bookworm-slim node -e "..."
+#     -> no output after 2 minutes
+# V8's JIT is what QEMU cannot follow. Static binaries emulate fine — the Go
+# sidecar runs — but anything Node-based does not.
+#
+# So the image is NATIVE arch (arm64 here) and cross-packages an x64 artifact.
+# That is sound because packaging is archive-and-metadata work, not execution:
+# electron-builder downloads the linux-x64 Electron dist and fpm writes it into
+# a package stamped Architecture: amd64. No x64 code runs during the build.
+#
+# The one thing that changes: electron-builder ships prebuilt fpm for
+# linux-x86_64 only, so on arm64 it needs the system fpm (the Ruby gem, which is
+# architecture-independent) via USE_SYSTEM_FPM.
+FROM node:20-bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates python3 git \
+      ruby ruby-dev build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
+# fpm is what actually writes the .deb. Pinned so the packaging tool is not a
+# moving part of the verification.
+RUN gem install --no-document fpm -v 1.15.1
+
+# Pinned to the version in package.json devDependencies. A floating version here
+# would mean the artifact under test is not the artifact CI builds.
+RUN npm install -g electron-builder@25.1.8
+
+ENV USE_SYSTEM_FPM=true
+WORKDIR /app

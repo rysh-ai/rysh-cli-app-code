@@ -12,7 +12,9 @@ export function Footer() {
   const voiceState = useStore((s) => s.voiceState);
   const voiceError = useStore((s) => s.voiceError);
 
-  const activePaneID = snapshot?.active_pane_id || '';
+  // The pane THIS window focuses, not the daemon's — the status bar has to name
+  // the mode of the pane the keystrokes actually reach (see resolveFocus).
+  const activePaneID = useStore((s) => s.getEffectiveActivePaneID());
   const inputMode = getInputMode(activePaneID);
 
   // Find active tab for pipeline state

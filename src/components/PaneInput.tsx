@@ -112,7 +112,7 @@ export const PaneInput = React.memo(function PaneInput({
   const inputRef = useRef<HTMLInputElement>(null);
   const inputText = useStore((s) => s.paneInputTexts[paneId] || '');
   const setPaneInputText = useStore((s) => s.setPaneInputText);
-  const setActivePaneOverride = useStore((s) => s.setActivePaneOverride);
+  const focusPane = useStore((s) => s.focusPane);
   const mode = useStore((s) => s.mode);
   const voiceEnabled = useStore((s) => s.voiceConfig?.enabled === true);
   const voiceState = useStore((s) => s.voiceState);
@@ -144,10 +144,22 @@ export const PaneInput = React.memo(function PaneInput({
   // focus stays on the previously active pane and text goes to the wrong pane.
   // Only steal focus in normal mode (not while a keyboard mode like navigate/
   // pane/rename is active), and re-run when navigate mode returns to normal.
+  //
+  // isActive comes from the store's client-owned focus, so this only ever fires
+  // for a move the user made — it can no longer be driven by a daemon-side
+  // focus change (see resolveFocus in store.ts).
   useEffect(() => {
-    if (isActive && mode === 'normal' && document.activeElement !== inputRef.current) {
-      inputRef.current?.focus({ preventScroll: true });
-    }
+    if (!isActive || mode !== 'normal') return;
+    const grab = () => {
+      if (document.activeElement !== inputRef.current) {
+        inputRef.current?.focus({ preventScroll: true });
+      }
+    };
+    grab();
+    // A pane that just expanded out of a stack is still laying out when
+    // isActive flips, so try once more after paint.
+    const raf = requestAnimationFrame(grab);
+    return () => cancelAnimationFrame(raf);
   }, [isActive, mode]);
 
   function clearCompletion() {
@@ -220,15 +232,6 @@ export const PaneInput = React.memo(function PaneInput({
     compRef.current = { candidates: values, names, index: -1, prefixPart, suffix };
     setCompMenu({ names, index: -1 });
   }
-
-  // Auto-focus when this pane becomes active and mode is normal
-  useEffect(() => {
-    if (isActive && mode === 'normal') {
-      requestAnimationFrame(() => {
-        inputRef.current?.focus();
-      });
-    }
-  }, [isActive, mode]);
 
   // ── Prompt line ──────────────────────────────────────────────────────────
   let promptChar: string;
@@ -603,9 +606,14 @@ export const PaneInput = React.memo(function PaneInput({
           }
         }}
         onFocus={() => {
+          // Reached when the user clicks (or tabs) straight into an inactive
+          // pane's input — PaneBox's mousedown handler ignores INPUT targets, so
+          // this is the click for that case. The auto-focus effect above only
+          // ever targets the already-active pane, so it cannot come back here
+          // and move focus on its own.
           const currentActive = useStore.getState().getEffectiveActivePaneID();
           if (paneId !== currentActive) {
-            setActivePaneOverride(paneId);
+            focusPane(paneId);
             sendCommand('focus_pane_by_id', { id: paneId });
           }
         }}

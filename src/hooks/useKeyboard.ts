@@ -3,6 +3,7 @@ import { useStore, findPane } from '../store';
 import { sendCommand } from '../utils/commands';
 import { voice } from '../utils/voice';
 import { paneShowsLiveApp } from '../utils/paneView';
+import { submitApproval } from '../utils/approvals';
 
 /**
  * Global keyboard handler — mirrors the TUI keybindings exactly.
@@ -327,6 +328,12 @@ function handleTabMode(e: KeyboardEvent) {
       sendCommand('create_tab');
       store.setMode('normal');
       break;
+    case 'v': case 'V':
+      // Flip the tab bar between the horizontal strip and the left-hand
+      // column. Stays in tab mode, like the TUI (rysh-cli 408a9a8), so the
+      // result can be eyeballed and flipped straight back.
+      sendCommand('set_tab_orientation', { orientation: 'toggle' });
+      break;
     case 'r': case 'R': {
       // Rename the active tab via an inline input (mirrors TUI ctrl+t r).
       const snap = store.snapshot;
@@ -453,10 +460,16 @@ function handleLayoutMode(e: KeyboardEvent) {
       sendCommand('resize_pane_width', { delta: 1 }); break;
     case 'ArrowLeft':
       sendCommand('resize_pane_width', { delta: -1 }); break;
-    // Resize pane height
-    case 'ArrowUp':
-      sendCommand('resize_pane_height', { delta: 1 }); break;
+    // Resize pane height. delta is a SCREEN DIRECTION, not a magnitude: +1
+    // points toward the higher index (down/right), which is what the daemon
+    // reads to decide whether the focused pane grows or shrinks (rysh-cli
+    // internal/actors/lane.go). This axis had the two arrows swapped — ↑ sent +1
+    // — so every vertical resize in the app moved the opposite way to the same
+    // key in the TUI. The width pair below/above was always right, which is why
+    // it went unnoticed.
     case 'ArrowDown':
+      sendCommand('resize_pane_height', { delta: 1 }); break;
+    case 'ArrowUp':
       sendCommand('resize_pane_height', { delta: -1 }); break;
     // Equalize horizontal (all lane widths)
     case 'h': case '=':
@@ -467,8 +480,15 @@ function handleLayoutMode(e: KeyboardEvent) {
     // Swap active lane with next
     case 's':
       sendCommand('swap_pane'); break;
-    // Toggle fullscreen
+    // Toggle fullscreen, then LEAVE layout mode — same as the TUI's ctrl+l m
+    // (rysh-cli internal/tui/model_update.go sets modeNormal before toggling).
+    // Returning to normal mode is what hands the keyboard back to the pane:
+    // PaneBox only forwards keystrokes to an interactive program (claude, vim)
+    // while mode === 'normal'. Staying in layout mode left a maximized claude
+    // pane looking right but deaf — every key went to this handler instead, so
+    // the next letter typed silently equalized or swapped lanes.
     case 'm': {
+      store.setMode('normal');
       const paneID = store.getEffectiveActivePaneID();
       if (paneID) {
         store.setFullscreenPaneID(store.fullscreenPaneID === paneID ? null : paneID);
@@ -485,9 +505,11 @@ function handleResizeMode(e: KeyboardEvent) {
       sendCommand('resize_pane', { delta: -1 }); break;
     case 'l': case 'ArrowRight':
       sendCommand('resize_pane', { delta: 1 }); break;
-    case 'k': case 'ArrowUp':
-      sendCommand('resize_pane_height', { delta: 1 }); break;
+    // Same screen-direction encoding as layout mode above, and the same swap
+    // was here: j/↓ is +1, k/↑ is -1 (matches the TUI's ctrl+p j/k).
     case 'j': case 'ArrowDown':
+      sendCommand('resize_pane_height', { delta: 1 }); break;
+    case 'k': case 'ArrowUp':
       sendCommand('resize_pane_height', { delta: -1 }); break;
   }
   if (e.ctrlKey && e.key === 'p') {
@@ -570,19 +592,6 @@ function handleRejectReasonMode(e: KeyboardEvent) {
     submitApproval('no_with_explanation', reason);
     if (input) input.value = '';
   }
-}
-
-function submitApproval(decision: string, reason?: string) {
-  const store = useStore.getState();
-  if (!store.pendingApproval) return;
-  sendCommand('approval_response', {
-    pane_id: store.pendingApproval.pane_id,
-    request_id: store.pendingApproval.request.request_id,
-    decision,
-    reason: reason || '',
-  });
-  store.setPendingApproval(null);
-  store.setMode('normal');
 }
 
 // ── Scroll helpers ──
