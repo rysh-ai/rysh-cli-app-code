@@ -8,6 +8,7 @@ import { PaneCopyButton } from './components/PaneCopyButton';
 import { useStore } from './store';
 import { sendCommand } from './utils/commands';
 import { PaneBox } from './components/PaneBox';
+import { MobileUIContext } from './mobileUIContext';
 import {
   rehydratePane,
   resolveOutput,
@@ -280,13 +281,17 @@ function MobileScreens() {
               const conv = buildConversationMessages(rp, inputMode);
               const paneForBox = output !== rp.output ? { ...rp, output } : rp;
               return (
-                <PaneBox
-                  pane={paneForBox}
-                  isActive
-                  inputMode={inputMode}
-                  pipelineActive={pipelineActive}
-                  conversationMessages={conv}
-                />
+                // Phone-only adjustments in shared components (PaneInput's
+                // >=16px font against iOS focus-zoom).
+                <MobileUIContext.Provider value>
+                  <PaneBox
+                    pane={paneForBox}
+                    isActive
+                    inputMode={inputMode}
+                    pipelineActive={pipelineActive}
+                    conversationMessages={conv}
+                  />
+                </MobileUIContext.Provider>
               );
             })()
           ) : (

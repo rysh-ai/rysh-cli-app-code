@@ -197,6 +197,9 @@ describe('MobileApp — approving a gated tool from the phone', () => {
     expect(useStore.getState().approvalError).toBeNull();
   });
 
+  // F-47: the index travels as choice_idx (which ask_user consumes) and the
+  // label as reason. It used to be String(index) in reason, which ask_user
+  // handed to the model as a bare zero-based number.
   it('sends a choice by tapping it', () => {
     const send = pendingOnPhone({
       ...APPROVAL,
@@ -213,7 +216,111 @@ describe('MobileApp — approving a gated tool from the phone', () => {
     fireEvent.click(screen.getByText('stop here'));
 
     expect(approvalSent(send)).toEqual([
-      { pane_id: 'pane-1', request_id: 'req-7', decision: 'choice_selected', reason: '1' },
+      {
+        pane_id: 'pane-1',
+        request_id: 'req-7',
+        decision: 'choice_selected',
+        reason: 'stop here',
+        choice_idx: 1,
+      },
+    ]);
+  });
+});
+
+// F-92: ask_user's question arrives as an approval request of type "question".
+// It is not a gate, so it must not be shown or answered as one: Approve /
+// Always / Reject reached the model as "(user provided empty response)", and an
+// open question had no way to type an answer except "Reason…", sent and echoed
+// as a rejection.
+const QUESTION: PendingApproval = {
+  pane_id: 'pane-1',
+  request: {
+    request_id: 'req-q',
+    orchestrator_id: '',
+    tool_call_id: 'req-q',
+    type: 'question',
+    description: 'Which database should I use?',
+    choices: [],
+  },
+};
+
+describe('MobileApp — answering a question from the phone', () => {
+  it('shows a question, not an approval: no Approve / Always / Reject', () => {
+    pendingOnPhone(QUESTION);
+    render(<MobileApp />);
+
+    expect(screen.getByText('Which database should I use?')).toBeInTheDocument();
+    expect(screen.queryByText(/APPROVAL REQUIRED/)).toBeNull();
+    expect(screen.getByText(/QUESTION/)).toBeInTheDocument();
+    for (const name of [/^approve$/i, /^always$/i, /^reject$/i, /reason/i]) {
+      expect(screen.queryByRole('button', { name })).toBeNull();
+    }
+  });
+
+  it('sends a typed answer as yes + the text', () => {
+    const send = pendingOnPhone(QUESTION);
+    render(<MobileApp />);
+
+    fireEvent.change(screen.getByPlaceholderText(/answer/i), { target: { value: 'use postgres' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    expect(approvalSent(send)).toEqual([
+      { pane_id: 'pane-1', request_id: 'req-q', decision: 'yes', reason: 'use postgres' },
+    ]);
+    expect(useStore.getState().pendingApproval).toBeNull();
+  });
+
+  it('sends the answer on Enter in the answer field', () => {
+    const send = pendingOnPhone(QUESTION);
+    render(<MobileApp />);
+
+    const input = screen.getByPlaceholderText(/answer/i);
+    fireEvent.change(input, { target: { value: 'sqlite' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    expect(approvalSent(send)).toEqual([
+      { pane_id: 'pane-1', request_id: 'req-q', decision: 'yes', reason: 'sqlite' },
+    ]);
+  });
+
+  it('does not send an empty answer', () => {
+    const send = pendingOnPhone(QUESTION);
+    render(<MobileApp />);
+
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    expect(approvalSent(send)).toEqual([]);
+    expect(useStore.getState().pendingApproval).not.toBeNull();
+  });
+
+  it('declines with a tap', () => {
+    const send = pendingOnPhone(QUESTION);
+    render(<MobileApp />);
+
+    fireEvent.click(screen.getByRole('button', { name: /decline/i }));
+
+    expect(approvalSent(send)).toEqual([
+      { pane_id: 'pane-1', request_id: 'req-q', decision: 'no', reason: '' },
+    ]);
+  });
+
+  it('still answers a multiple-choice question by tapping an option', () => {
+    const send = pendingOnPhone({
+      ...QUESTION,
+      request: {
+        ...QUESTION.request,
+        choices: [
+          { label: 'postgres', description: '' },
+          { label: 'sqlite', description: '' },
+        ],
+      },
+    });
+    render(<MobileApp />);
+
+    fireEvent.click(screen.getByText('sqlite'));
+
+    expect(approvalSent(send)).toEqual([
+      { pane_id: 'pane-1', request_id: 'req-q', decision: 'choice_selected', reason: 'sqlite', choice_idx: 1 },
     ]);
   });
 });

@@ -1,4 +1,4 @@
-import { app } from 'electron'
+import { app, dialog } from 'electron'
 import { spawn } from 'child_process'
 import {
   closeSync,
@@ -182,12 +182,65 @@ function tryClaimSlot(slot: number): boolean {
   return false
 }
 
-/** Lowest free secondary slot (>= start), or -1 if all are taken. */
-function claimLowestFreeSlot(start: number): number {
+/** Lowest slot >= start that `claim` wins, or -1 if all are taken. */
+function claimLowestFreeSlot(start: number, claim: (slot: number) => boolean): number {
   for (let n = start; n < MAX_SLOTS; n++) {
-    if (tryClaimSlot(n)) return n
+    if (claim(n)) return n
   }
   return -1
+}
+
+/** The slot this launch takes, or why it must not start at all. */
+export type SlotChoice = { slot: number } | { error: string }
+
+/**
+ * Which slot a launch with `argv` takes, claiming it through `claim` (which
+ * returns true when it won the slot's lockfile). Pure apart from `claim`, so it
+ * is tested with a fake.
+ *
+ * A launch only ever lands on a slot it actually holds. It never falls back into
+ * slot 0 it did not ask for: slot 0 is the primary profile (the user's own
+ * workspaces, recents and boot session), and E-78 was `--instance=7`, with 7
+ * held, opening the founder's primary workspaces. So:
+ *
+ *   - `--instance=N`  → N, or an error when N is invalid or held. No fallback:
+ *     the user named a slot, and any other slot is a different profile.
+ *   - `--new-instance` → the lowest free slot >= 1, or an error when all are held.
+ *   - plain launch    → the lowest free slot, 0 included (0 when no primary runs).
+ *     All held is an error too: the old fallback ran as slot 0 without its lock,
+ *     on the profile of the primary that was holding it.
+ */
+export function chooseSlot(argv: readonly string[], claim: (slot: number) => boolean): SlotChoice {
+  const explicitArg = argv.find((a) => a.startsWith(INSTANCE_FLAG))
+  if (explicitArg) {
+    const raw = explicitArg.slice(INSTANCE_FLAG.length)
+    const n = /^\d+$/.test(raw) ? Number(raw) : NaN
+    if (!Number.isInteger(n) || n >= MAX_SLOTS) {
+      return { error: `--instance=${raw} is not an instance slot: use a number from 0 to ${MAX_SLOTS - 1}.` }
+    }
+    if (claim(n)) return { slot: n }
+    return {
+      error:
+        `Instance ${n} is already running. Switch to it, quit it first, or launch with ` +
+        `${NEW_INSTANCE_FLAG} to open a new instance in a free slot.`,
+    }
+  }
+
+  if (argv.includes(NEW_INSTANCE_FLAG)) {
+    const free = claimLowestFreeSlot(1, claim)
+    if (free >= 0) return { slot: free }
+    return { error: `All ${MAX_SLOTS - 1} secondary instance slots are in use. Quit an instance first.` }
+  }
+
+  // Plain launch: EVERY launch is a real new instance. Claim the lowest free
+  // slot — slot 0 (the legacy profile/port/session) included, so the first
+  // launch is byte-for-byte the old primary and each further plain launch
+  // stacks a fresh, fully-isolated instance beside it instead of focusing the
+  // existing window. Slot 0 now holds a lockfile like every other slot (the
+  // Electron single-instance lock is gone — multiple instances are the point).
+  const free = claimLowestFreeSlot(0, claim)
+  if (free >= 0) return { slot: free }
+  return { error: `All ${MAX_SLOTS} instance slots are in use. Quit an instance first.` }
 }
 
 /**
@@ -224,44 +277,27 @@ function makeInstance(slot: number): InstanceInfo {
  * Decide which instance slot this process is, claiming its lockfile and (for
  * secondaries) switching userData to a per-slot profile. MUST be called once,
  * synchronously, at the very top of the main process — before the app is ready
- * and before any userData-dependent code runs (managers, requestSingleInstanceLock).
+ * and before any userData-dependent code runs (managers).
  *
- * Policy:
- *   - A PLAIN launch is always the PRIMARY (slot 0). It takes no slot lockfile;
- *     requestSingleInstanceLock (in main) is its dedupe, so a second plain
- *     launch focuses the existing window — the unchanged legacy behaviour.
- *   - A SECONDARY instance is deliberate: `--new-instance` claims the lowest free
- *     slot >= 1, and `--instance=N` requests a specific one (falling back to the
- *     lowest free if N is taken). Secondaries are fully isolated and coexist.
+ * Policy: chooseSlot. When it refuses (requested slot held, or no slot free),
+ * the launch stops here with an error dialog — no window, no profile switch, no
+ * daemon — rather than starting on a slot it does not hold.
  */
 export function allocateInstance(): InstanceInfo {
-  const argv = process.argv
+  const choice = chooseSlot(process.argv, tryClaimSlot)
+  if ('error' in choice) refuseLaunch(choice.error)
+  return makeInstance(choice.slot)
+}
 
-  const explicitArg = argv.find((a) => a.startsWith(INSTANCE_FLAG))
-  if (explicitArg) {
-    const n = parseInt(explicitArg.slice(INSTANCE_FLAG.length), 10)
-    if (Number.isInteger(n) && n >= 0 && n < MAX_SLOTS && tryClaimSlot(n)) {
-      return makeInstance(n)
-    }
-    // Requested slot is taken or invalid — degrade to the lowest free slot.
-    const free = claimLowestFreeSlot(0)
-    return makeInstance(free >= 0 ? free : 0)
-  }
-
-  if (argv.includes(NEW_INSTANCE_FLAG)) {
-    const free = claimLowestFreeSlot(1)
-    // Every slot busy (pathological) — fall back to the primary path.
-    return makeInstance(free >= 0 ? free : 0)
-  }
-
-  // Plain launch: EVERY launch is a real new instance. Claim the lowest free
-  // slot — slot 0 (the legacy profile/port/session) included, so the first
-  // launch is byte-for-byte the old primary and each further plain launch
-  // stacks a fresh, fully-isolated instance beside it instead of focusing the
-  // existing window. Slot 0 now holds a lockfile like every other slot (the
-  // Electron single-instance lock is gone — multiple instances are the point).
-  const free = claimLowestFreeSlot(0)
-  return makeInstance(free >= 0 ? free : 0)
+/** Ends a launch chooseSlot refused. Before app ready, so nothing else has started. */
+function refuseLaunch(message: string): never {
+  console.error(`[instance] Not starting: ${message}`)
+  // Safe before `ready` (on Linux it prints to stderr instead of a dialog).
+  dialog.showErrorBox('Rysh did not start', message)
+  app.exit(1)
+  // app.exit closes the app asynchronously; nothing after allocateInstance in
+  // main.ts may run (it would build managers on a slot this process does not hold).
+  process.exit(1)
 }
 
 /** Release this process's slot lockfile. Idempotent; safe to call on quit/exit. */

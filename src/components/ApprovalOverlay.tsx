@@ -58,6 +58,67 @@ export function ApprovalOverlay() {
 
   const req = pendingApproval.request;
 
+  // ask_user's question (F-92). Not a gate: answering it with Approve/Reject
+  // reached the model as an empty response, so it gets an answer field, its
+  // choices and a Decline — and none of the gate buttons. A typed answer is
+  // sent as `yes` + the text, which ask_user hands the model as the answer.
+  if (req.type === 'question') {
+    const answer = reason.trim();
+    const sendAnswer = () => {
+      if (answer) submitApproval('yes', answer);
+    };
+    return (
+      <div className="fixed inset-0 z-[300] flex items-center justify-center bg-black/60">
+        <div className="bg-[#2a2a2a] border-2 border-[#00d7d7] rounded-lg px-6 py-4 max-w-[600px] w-[90%] shadow-lg">
+          <h3 className="text-[#ffffaf] text-sm font-bold mb-2">QUESTION</h3>
+          <div className="text-[#d4d4d4] text-[13px] mb-1.5 whitespace-pre-wrap break-words">
+            {req.description}
+          </div>
+          {req.choices && req.choices.length > 0 && <ChoiceList choices={req.choices} />}
+          <div className="mt-2 flex gap-2">
+            <input
+              type="text"
+              id="question-answer"
+              placeholder="type your answer..."
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  sendAnswer();
+                }
+              }}
+              className="flex-1 min-w-0 bg-[#1a1a1a] border border-[#00d7d7] rounded px-2.5 py-1.5 text-[#d4d4d4] font-mono text-[13px] outline-none"
+              autoFocus
+            />
+            <button
+              type="button"
+              onClick={sendAnswer}
+              disabled={!answer}
+              className={`${BTN} bg-[#00875f] border-[#00af87] text-white font-bold shrink-0 disabled:opacity-40`}
+            >
+              Send
+            </button>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => submitApproval('no')}
+              className={`${BTN} bg-[#333] border-[#555] text-[#d4d4d4]`}
+            >
+              Decline
+            </button>
+            <span className="text-[#808080] text-[12px]">
+              <kbd className="bg-[#444] text-[#d4d4d4] px-1 rounded font-mono">Enter</kbd> send
+              &nbsp;
+              <kbd className="bg-[#444] text-[#d4d4d4] px-1 rounded font-mono">Esc</kbd> decline
+            </span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="fixed inset-0 z-[300] flex items-center justify-center bg-black/60">
       <div className="bg-[#2a2a2a] border-2 border-[#00d7d7] rounded-lg px-6 py-4 max-w-[600px] w-[90%] shadow-lg">
@@ -73,26 +134,7 @@ export function ApprovalOverlay() {
           />
         )}
 
-        {req.choices && req.choices.length > 0 && (
-          <div className="my-2">
-            <div className="text-[#808080] text-[11px] mb-1">Choices:</div>
-            {req.choices.map((choice, i) => (
-              <div
-                key={i}
-                className="flex items-center gap-2 text-[13px] text-[#d4d4d4] py-1 px-2 rounded hover:bg-[#333] cursor-pointer"
-                onClick={() => submitApproval('choice_selected', String(i))}
-              >
-                <kbd className="bg-[#444] text-[#d4d4d4] px-1.5 rounded font-mono text-[11px] shrink-0">
-                  {i + 1}
-                </kbd>
-                <span className="font-bold">{choice.label}</span>
-                {choice.description && (
-                  <span className="text-[#808080] text-[12px] ml-1">— {choice.description}</span>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
+        {req.choices && req.choices.length > 0 && <ChoiceList choices={req.choices} />}
 
         {mode === 'approval' && (
           <div className="mt-3 flex flex-wrap gap-2">
@@ -162,6 +204,30 @@ export function ApprovalOverlay() {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// Tapping a choice answers with its index (choice_idx) and label (F-47).
+function ChoiceList({ choices }: { choices: { label: string; description: string }[] }) {
+  return (
+    <div className="my-2">
+      <div className="text-[#808080] text-[11px] mb-1">Choices:</div>
+      {choices.map((choice, i) => (
+        <div
+          key={i}
+          className="flex items-center gap-2 text-[13px] text-[#d4d4d4] py-1 px-2 rounded hover:bg-[#333] cursor-pointer"
+          onClick={() => submitApproval('choice_selected', choice.label, i)}
+        >
+          <kbd className="bg-[#444] text-[#d4d4d4] px-1.5 rounded font-mono text-[11px] shrink-0">
+            {i + 1}
+          </kbd>
+          <span className="font-bold">{choice.label}</span>
+          {choice.description && (
+            <span className="text-[#808080] text-[12px] ml-1">— {choice.description}</span>
+          )}
+        </div>
+      ))}
     </div>
   );
 }

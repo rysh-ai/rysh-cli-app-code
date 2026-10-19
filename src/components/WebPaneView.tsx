@@ -13,6 +13,14 @@ import {
 
 interface Props {
   paneId: string;
+  /**
+   * A meeting pane (design 043) hosting its meeting page: the URL and profile
+   * come from the pane's meeting.* meta instead of a `##mode new web` binding,
+   * the view is created as a meeting view (camera/mic/screen share for the
+   * meeting platform, electron/meetingPermissions.ts), and there is no URL bar
+   * or Ask Rysh panel — back/forward/reload stay.
+   */
+  meeting?: { url: string; profile: string };
 }
 
 /**
@@ -22,7 +30,7 @@ interface Props {
  *
  * In browser mode (no Electron), shows a message that web panes require the desktop app.
  */
-export const WebPaneView = React.memo(function WebPaneView({ paneId }: Props) {
+export const WebPaneView = React.memo(function WebPaneView({ paneId, meeting }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const status = useStore((s) => s.webPaneStatuses[paneId]);
   // The backend web binding (set by `##mode new web`): drives creation/navigation
@@ -34,8 +42,9 @@ export const WebPaneView = React.memo(function WebPaneView({ paneId }: Props) {
   const binding = useStore((s) => s.webBindings[paneId]);
   const snapUrl = useStore((s) => findPane(s.snapshot, paneId)?.web_url || '');
   const snapProfile = useStore((s) => findPane(s.snapshot, paneId)?.web_profile || '');
-  const webUrl = binding?.url || snapUrl;
-  const webProfile = binding?.profile || snapProfile;
+  const webUrl = meeting ? meeting.url : binding?.url || snapUrl;
+  const webProfile = meeting ? meeting.profile : binding?.profile || snapProfile;
+  const isMeeting = !!meeting;
   // The profile this component last asked the main process to bind. null until
   // the first create. When it differs from webProfile, the backend rebound the
   // pane to a new profile (`##mode new web --profile <other>`) and we must call
@@ -46,7 +55,7 @@ export const WebPaneView = React.memo(function WebPaneView({ paneId }: Props) {
   // input-mode cycling (which remounts this view). Undefined → OPEN, so the
   // panel shows on the right the first time a web pane opens; an explicit close
   // is remembered.
-  const chatOpen = useStore((s) => s.webChatOpen[paneId] !== false);
+  const chatOpen = useStore((s) => s.webChatOpen[paneId] !== false) && !isMeeting;
   const setWebChatOpen = useStore((s) => s.setWebChatOpen);
   const isElectron = !!window.electronAPI;
 
@@ -124,11 +133,12 @@ export const WebPaneView = React.memo(function WebPaneView({ paneId }: Props) {
       // profile's partition. The manager reattaches the live view when the
       // profile is unchanged and destroys+recreates when it differs.
       createdProfileRef.current = webProfile;
-      window.electronAPI!.webPane.create(paneId, url, webProfile);
+      if (isMeeting) window.electronAPI!.webPane.create(paneId, url, webProfile, undefined, { meeting: true });
+      else window.electronAPI!.webPane.create(paneId, url, webProfile);
     } else {
       window.electronAPI!.webPane.navigate(paneId, url);
     }
-  }, [isElectron, paneId, webUrl, webProfile]);
+  }, [isElectron, paneId, webUrl, webProfile, isMeeting]);
 
   const handleNavigate = useCallback((url: string) => {
     if (!isElectron) return;
@@ -149,6 +159,23 @@ export const WebPaneView = React.memo(function WebPaneView({ paneId }: Props) {
     if (!isElectron) return;
     window.electronAPI!.webPane.reload(paneId);
   }, [paneId, isElectron]);
+
+  if (!isElectron && isMeeting) {
+    // A server-side headless browser has no camera or microphone of yours, so
+    // a meeting page is desktop-only; say so and hand over the link.
+    return (
+      <div className="flex-1 flex items-center justify-center text-[#888] p-5 text-center text-sm">
+        <div>
+          <div className="text-base mb-2">Open this session in the Rysh desktop app to join the meeting here</div>
+          {webUrl && (
+            <a href={webUrl} target="_blank" rel="noreferrer" className="text-[#87d7ff] underline break-all">
+              {webUrl}
+            </a>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   if (!isElectron) {
     // Browser mode (roadmap W12): a plain tab cannot embed third-party pages
@@ -185,6 +212,21 @@ export const WebPaneView = React.memo(function WebPaneView({ paneId }: Props) {
         {status?.loading && (
           <span className="text-[#00d7d7] text-[10px] animate-pulse">loading...</span>
         )}
+        {status?.loadError && !status.loading && (
+          <>
+            <span role="alert" className="text-[#f87171] text-[11px] truncate" title={status.loadError.url}>
+              Couldn't load {hostOf(status.loadError.url)}: {status.loadError.description}
+            </span>
+            <button
+              onClick={() => handleNavigate(status.loadError!.url)}
+              title="Try loading the page again"
+              className="whitespace-nowrap"
+            >
+              Retry
+            </button>
+          </>
+        )}
+        {!isMeeting && (<>
         <button
           onClick={() => setWebChatOpen(paneId, !chatOpen)}
           title={chatOpen ? 'Hide Ask Rysh' : 'Ask Rysh (AI can browse this page)'}
@@ -216,6 +258,7 @@ export const WebPaneView = React.memo(function WebPaneView({ paneId }: Props) {
             }
           }}
         />
+        </>)}
       </div>
 
       {/* Page area + optional Ask-Rysh chat. The native WebContentsView is
@@ -480,4 +523,13 @@ function ServerWebPaneView({
       )}
     </div>
   );
+}
+
+/** The host of a failed URL for the toolbar notice; the whole URL stays in its tooltip. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host || url;
+  } catch {
+    return url;
+  }
 }

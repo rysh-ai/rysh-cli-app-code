@@ -14,7 +14,13 @@
 // None of this runs in Electron: the desktop app's sidecar runs in control
 // mode — loopback-only, no login — so there is nothing to present.
 
-const STORAGE_KEY = 'rysh.web.token';
+// localStorage is shared across an origin, including different proxied
+// sessions. Scope tokens to the API base so login/logout in one session
+// cannot overwrite or clear another's credentials. Do not migrate the old
+// unscoped token: we cannot tell which session issued it.
+function storageKey(): string {
+  return `rysh.web.token:${apiBase()}`;
+}
 
 /**
  * Base URL prefix for same-origin API calls. The bundle may be served behind a
@@ -31,7 +37,7 @@ export function apiBase(): string {
 /** The stored access token, or '' when nobody is signed in. */
 export function getToken(): string {
   try {
-    return window.localStorage.getItem(STORAGE_KEY) || '';
+    return window.localStorage.getItem(storageKey()) || '';
   } catch {
     // Private-mode / disabled storage: treat as signed out rather than
     // breaking the whole app on a getItem throw.
@@ -41,7 +47,7 @@ export function getToken(): string {
 
 export function setToken(token: string): void {
   try {
-    window.localStorage.setItem(STORAGE_KEY, token);
+    window.localStorage.setItem(storageKey(), token);
   } catch {
     /* storage unavailable — the session simply won't survive a reload */
   }
@@ -49,7 +55,7 @@ export function setToken(token: string): void {
 
 export function clearToken(): void {
   try {
-    window.localStorage.removeItem(STORAGE_KEY);
+    window.localStorage.removeItem(storageKey());
   } catch {
     /* nothing to do */
   }

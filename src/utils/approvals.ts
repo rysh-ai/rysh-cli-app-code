@@ -27,8 +27,16 @@ export type ApprovalDecision =
  * Answer the pending approval, then close the dialog. No-op when nothing is
  * waiting, so a double-tap (or a key racing a tap) cannot answer twice — the
  * second call finds pendingApproval already null.
+ *
+ * choiceIdx goes with 'choice_selected' only: the zero-based index into the
+ * request's choices, which the ask_user tool turns into the option text (F-47).
+ * Pass the option's label as reason, for the pane echo.
  */
-export function submitApproval(decision: ApprovalDecision, reason?: string): void {
+export function submitApproval(
+  decision: ApprovalDecision,
+  reason?: string,
+  choiceIdx?: number,
+): void {
   const store = useStore.getState();
   if (!store.pendingApproval) return;
   sendCommand('approval_response', {
@@ -36,6 +44,7 @@ export function submitApproval(decision: ApprovalDecision, reason?: string): voi
     request_id: store.pendingApproval.request.request_id,
     decision,
     reason: reason || '',
+    ...(decision === 'choice_selected' ? { choice_idx: choiceIdx ?? 0 } : {}),
   });
   store.setPendingApproval(null);
   store.setMode('normal');

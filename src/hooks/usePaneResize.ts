@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef } from 'react';
 import { sendCommand } from '../utils/commands';
 import { useStore } from '../store';
+import { measureVTCell } from '../utils/cellMetrics';
 
 /**
  * usePaneResize keeps a pane's PTY + virtual terminal sized to the actual
@@ -23,25 +24,9 @@ import { useStore } from '../store';
  * ResizeObserver is wired up exactly when a measurable node exists.
  */
 
-// Measured monospace cell size for the .vt-screen metrics (13px, line-height
-// 1.2, app mono font stack). Cached after first measure — it only depends on the
-// font, which doesn't change at runtime.
-let cellW = 0;
-let cellH = 0;
-function measureCell(): { w: number; h: number } {
-  if (cellW > 0 && cellH > 0) return { w: cellW, h: cellH };
-  const probe = document.createElement('span');
-  probe.style.cssText =
-    'position:absolute;visibility:hidden;white-space:pre;font-size:13px;line-height:1.2;' +
-    'font-family:"JetBrains Mono","Fira Code","Cascadia Code","SF Mono","Menlo","Monaco","Consolas",monospace;';
-  probe.textContent = 'M'.repeat(100);
-  document.body.appendChild(probe);
-  const w = probe.getBoundingClientRect().width / 100;
-  document.body.removeChild(probe);
-  cellW = w > 0 ? w : 7.8; // fallback if measured before fonts are ready
-  cellH = 13 * 1.2; // font-size 13px × line-height 1.2 (see .vt-screen)
-  return { w: cellW, h: cellH };
-}
+// Cell size comes from utils/cellMetrics, the one owner shared with VTScreen
+// and the wheel path, so the PTY grid matches what actually renders.
+const measureCell = measureVTCell;
 
 // The VT content has 2px/4px padding (.vt-screen) — subtract it so the computed
 // grid matches what actually renders.

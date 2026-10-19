@@ -9,34 +9,27 @@ import { WebPaneView } from './WebPaneView';
 import { EmailClientView } from './EmailClientView';
 import { WhatsAppClientView } from './WhatsAppClientView';
 import { AgentsBoardView } from './AgentsBoardView';
+import { MeetingPaneView } from './MeetingPaneView';
+import { MeetingControls } from './MeetingControls';
+import { MEETING_PANE_TYPE, meetingInfo } from '../meeting/paneMeta';
+import { CompanyView } from './CompanyView';
 import { TouchTermInput, type TermEcho } from './TouchTermInput';
 import { TouchKeyMenu } from './TouchKeyMenu';
+import { TouchPasteButton } from './TouchPasteButton';
 import { usePaneResize } from '../hooks/usePaneResize';
+import { useVisiblePane } from '../utils/visiblePanes';
 import { paneShowsLiveApp } from '../utils/paneView';
+import { isWebSyncOff, resumeWebSync } from '../utils/paneSync';
 import type { PaneSnapshot, InputMode, ConversationMessage } from '../types';
 import { FIXED_INPUT_MODES } from '../types';
+import { measureCellOf } from '../utils/cellMetrics';
 
 // ── VT wheel forwarding helpers ──
 //
-// Cached monospace cell metrics for translating a wheel event's pixel position
-// into 1-based VT cell coordinates. Measured from the .vt-screen computed font
+// Cell metrics for translating a wheel event's pixel position into 1-based VT
+// cell coordinates: utils/cellMetrics measures the .vt-screen's computed font
 // (canvas measureText), re-measured only when the font changes.
-let vtCellCache: { w: number; h: number; font: string } | null = null;
-function vtCellSize(vtEl: HTMLElement): { w: number; h: number } {
-  const cs = window.getComputedStyle(vtEl);
-  const font = `${cs.fontSize} ${cs.fontFamily}`;
-  if (vtCellCache && vtCellCache.font === font) return vtCellCache;
-  let w = 7.8;
-  const ctx = document.createElement('canvas').getContext('2d');
-  if (ctx) {
-    ctx.font = font;
-    const m = ctx.measureText('M').width;
-    if (m > 0) w = m;
-  }
-  const h = (parseFloat(cs.fontSize) || 13) * 1.2; // .vt-line line-height is 1.2em
-  vtCellCache = { w, h, font };
-  return vtCellCache;
-}
+const vtCellSize = measureCellOf;
 
 // Encodes one wheel notch as an SGR Extended Mouse Mode (1006) sequence, the
 // same encoding the TUI's mouseToSGRBytes produces: \x1b[<{64|65};x;yM.
@@ -276,7 +269,12 @@ export const PaneBox = React.memo(function PaneBox({
   // terminal UI cannot end up showing different boards for one pane — the empty
   // and invalid cases are decided in one place, in Go.
   const isAgentsBoard = pane.pane_type === 'agents-board';
+  // Company Connect (design 037): a pane the daemon put in "company" mode
+  // renders the bound company from the follower's snapshot, never its text buffer.
+  const isCompany = inputMode === 'company';
   const boardId = pane.meta?.['board.id'] || '';
+  // Meeting pane (design 043): shell-less like the board, rendered by kind.
+  const isMeeting = pane.pane_type === MEETING_PANE_TYPE;
   // Insert-mode signal (mirrors rysh-cli dec4b7e): tint the active pane's accent
   // green while keystrokes land in the pane (normal mode — typing into PaneInput
   // or a raw/interactive pane), and keep the cyan accent during the multiplexer's
@@ -293,6 +291,9 @@ export const PaneBox = React.memo(function PaneBox({
   // 80x24 PTY default. Attached to the output container below; collapsed stacked
   // panes never attach it (they render only a title bar), so they don't resize.
   const contentResizeRef = usePaneResize(pane.id);
+  // Only panes on screen get live VT frames from the daemon; a collapsed
+  // stacked pane shows a title bar and needs none (utils/visiblePanes.ts).
+  useVisiblePane(pane.id, !isCollapsed);
 
   const handleMouseDown = useCallback(
     (e: React.MouseEvent) => {
@@ -554,6 +555,15 @@ export const PaneBox = React.memo(function PaneBox({
     [sendTouchBytes]
   );
 
+  // Touch paste: same wire path as the soft keyboard, as raw UTF-8 bytes (no
+  // bracketed-paste wrapper — same reasoning as the desktop paste effect).
+  const pasteTouchText = useCallback(
+    (text: string) => {
+      sendTouchBytes(Array.from(new TextEncoder().encode(text)), { kind: 'other' });
+    },
+    [sendTouchBytes]
+  );
+
   // Finger-drag scrollback (rysh-mobile fad8f75's touch scrollback, web
   // version): the VT view is a live screen, so drags are forwarded to the
   // child program as scroll — SGR mouse wheel when it tracks the mouse
@@ -613,6 +623,11 @@ export const PaneBox = React.memo(function PaneBox({
 
   const title = paneBorderTitle(pane, inputMode);
   const hasAttention = !!pane.attention_count && pane.attention_count > 0;
+  // Web sync off (`##pane sync off`, utils/paneSync.ts): the daemon has stopped
+  // streaming this pane's repaints, so what is drawn below is the last screen
+  // this window received. Marked in the title bar and the meta line, and the
+  // content is dimmed — a frozen agent screen must never pass for a live one.
+  const syncOff = isWebSyncOff(pane);
 
   // ── Collapsed stacked pane: single title bar line ──
   if (isCollapsed) {
@@ -628,6 +643,11 @@ export const PaneBox = React.memo(function PaneBox({
       >
         <span className="text-[#666] mr-1">{'\u2503'}</span>
         <span className="overflow-hidden text-ellipsis whitespace-nowrap flex-1">{title}</span>
+        {syncOff && (
+          <span className="ml-1 text-[#8a8a8a] text-[10px] shrink-0" title="web sync off">
+            SYNC OFF
+          </span>
+        )}
         {hasAttention && (
           <span className="ml-1 text-[#ffff00] text-[10px] shrink-0">
             {attentionIcon(pane.attention_category)} {pane.attention_count}
@@ -679,6 +699,9 @@ export const PaneBox = React.memo(function PaneBox({
           {showTouchInput && (
             <TouchKeyMenu onKey={sendKeySeq} appCursor={!!pane.app_cursor_keys} />
           )}
+          {/* Paste (touch, live interactive pane): a phone has no Cmd+V and
+              nothing visible to long-press in a VT pane. */}
+          {showTouchInput && <TouchPasteButton onPaste={pasteTouchText} />}
           {laneName && (
             <span
               className="text-[#8a8aaf] text-[10px] font-normal whitespace-nowrap"
@@ -701,6 +724,25 @@ export const PaneBox = React.memo(function PaneBox({
             <span className="bg-[#5f005f] text-[#ff87ff] px-1 rounded text-[10px] whitespace-nowrap">
               BOARD
             </span>
+          )}
+          {isMeeting && (
+            <span className="bg-[#1e3a5f] text-[#87d7ff] px-1 rounded text-[10px] whitespace-nowrap">
+              MEETING
+            </span>
+          )}
+          {syncOff && (
+            <button
+              type="button"
+              title="Web sync is off: this pane keeps running, but this window is not repainting it. Click to resume (##pane sync on)."
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                resumeWebSync(pane.id);
+              }}
+              className="bg-[#3a3a3a] text-[#bcbcbc] hover:bg-[#4a4a4a] hover:text-white px-1 rounded text-[10px] whitespace-nowrap cursor-pointer"
+            >
+              SYNC OFF
+            </button>
           )}
           {pane.controlling_share_id && (
             <span className="bg-[#005f5f] text-[#87ffff] px-1 rounded text-[10px] whitespace-nowrap">
@@ -790,6 +832,7 @@ export const PaneBox = React.memo(function PaneBox({
         {pane.listening_to_id && ` | listening:${pane.listening_to_id.substring(0, 8)}`}
         {pane.connected_to_pane_id && ` | connected:${pane.connected_to_pane_id.substring(0, 8)}`}
         {pane.registered_humanoid && ` | humanoid:${pane.registered_humanoid}`}
+        {syncOff && ' | web sync off — last screen shown'}
       </div>
 
       {/* Output. The wrapper is the authoritative PTY-sizing surface: its pixel
@@ -797,7 +840,7 @@ export const PaneBox = React.memo(function PaneBox({
           program) is sized to exactly this area. */}
       <div
         ref={contentRef}
-        className="flex-1 min-h-0 flex flex-col overflow-hidden"
+        className={`flex-1 min-h-0 flex flex-col overflow-hidden ${syncOff ? 'opacity-50' : ''}`}
         onWheel={liveVTVisible ? handleVTWheel : undefined}
         // Tapping the live screen focuses the hidden textarea → the phone
         // raises its soft keyboard (click fires synchronously from the tap).
@@ -820,8 +863,14 @@ export const PaneBox = React.memo(function PaneBox({
             model_view.go:buildPanePanel. */}
         {isAgentsBoard ? (
           <AgentsBoardView paneId={pane.id} boardId={boardId} />
+        ) : isMeeting ? (
+          // Shell-less too, and dispatched before the web branch: a meeting
+          // pane's page comes from its meeting.* meta, not a web binding.
+          <><MeetingPaneView paneId={pane.id} meta={pane.meta} /><MeetingControls paneId={pane.id} meetingId={pane.meta?.['meeting.id']} /></>
         ) : inputMode === 'web' ? (
           <WebPaneView paneId={pane.id} />
+        ) : isCompany ? (
+          <CompanyView paneId={pane.id} />
         ) : isEmailHumanoid ? (
           <EmailClientView paneId={pane.id} humanoidName={inputMode} />
         ) : isWhatsAppHumanoid ? (
@@ -869,6 +918,12 @@ export const PaneBox = React.memo(function PaneBox({
         // clothes.
         <div className="px-2.5 py-1 border-t border-[#333] bg-[#1a1a1a] shrink-0 text-[#808080] text-[11px] select-none">
           read-only view · agents post with <code className="text-[#87d7af]">rysh board post &lt;text&gt;</code>
+        </div>
+      ) : isMeeting ? (
+        // Shell-less: nothing to type into. Name the command that adds an agent.
+        <div className="px-2.5 py-1 border-t border-[#333] bg-[#1a1a1a] shrink-0 text-[#808080] text-[11px] select-none">
+          meeting pane · add an agent with{' '}
+          <code className="text-[#87d7af]">##meeting add agent {meetingInfo(pane.meta).id || '<id>'} &lt;agent&gt;</code>
         </div>
       ) : showsLiveApp ? (
         // On touch devices the footer doubles as the "input field": tapping it

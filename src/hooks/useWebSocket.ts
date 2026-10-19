@@ -1,8 +1,11 @@
 import { useEffect, useRef } from 'react';
-import { useStore, markWebActivated, markWebDeactivated } from '../store';
+import { useStore, markWebActivated, markWebDeactivated, capTail, MAX_CHAT_TURNS } from '../store';
 import { sendCommand } from '../utils/commands';
 import { resolveCompletionResult } from '../utils/completion';
+import { resolveMeetingToken } from '../meeting/daemonToken';
+import { resolveMeetingReply } from '../meeting/controls';
 import { wsAuthQuery } from '../utils/auth';
+import { resendVisiblePanes } from '../utils/visiblePanes';
 
 /**
  * Manages the WebSocket lifecycle: connect, receive snapshots/approvals,
@@ -19,12 +22,16 @@ export function useWebSocket() {
   // the same turn merge here to keep the queue small under bursty streaming.
   const pendingChatRef = useRef<Record<string, { turnId: string; text: string }[]>>({});
   const rafRef = useRef<number | null>(null);
+  const hiddenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     let unmounted = false;
 
     const flushPending = () => {
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+      if (hiddenTimerRef.current != null) clearTimeout(hiddenTimerRef.current);
       rafRef.current = null;
+      hiddenTimerRef.current = null;
       const pending = pendingRef.current;
       pendingRef.current = {};
       const pendingChat = pendingChatRef.current;
@@ -41,6 +48,27 @@ export function useWebSocket() {
         }
       }
     };
+
+    // Browsers stop running requestAnimationFrame callbacks in a hidden tab, so
+    // a flush scheduled only through rAF never ran while the tab was in the
+    // background: output from every pane of the session piled up in
+    // pendingRef, unbounded, for as long as the tab stayed hidden — hours or
+    // days — and then landed in one frame when the tab came back, freezing it.
+    // A hidden tab now flushes on a timer instead, and the queue itself is
+    // capped as it grows (see the pane_output case).
+    const scheduleFlush = () => {
+      if (rafRef.current != null || hiddenTimerRef.current != null) return;
+      if (document.hidden) hiddenTimerRef.current = setTimeout(flushPending, 500);
+      else rafRef.current = requestAnimationFrame(flushPending);
+    };
+    // A flush queued on rAF just before the tab was hidden would otherwise wait
+    // for the tab to come back; a timer queued while hidden should not keep the
+    // UI waiting once it is visible again.
+    const onVisibility = () => {
+      if (rafRef.current == null && hiddenTimerRef.current == null) return;
+      flushPending();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
 
     function connect() {
       const sidecarPort = useStore.getState().sidecarPort;
@@ -81,6 +109,9 @@ export function useWebSocket() {
         // reported a size has to report it again, or this window silently
         // stops constraining the panes it is showing.
         useStore.getState().bumpWsEpoch();
+        // Likewise the visible-pane filter: until this window names its panes
+        // again the daemon streams every pane's VT screen to it.
+        resendVisiblePanes();
       };
 
       ws.onmessage = (evt) => {
@@ -96,14 +127,27 @@ export function useWebSocket() {
             // deadline over a tunnel and left this UI permanently blank. Content
             // now arrives as byte-bounded batches after a layout-only snapshot.
             case 'pane_content':
-              if (Array.isArray(msg.data?.panes)) store.applyPaneContentSeed(msg.data.panes);
+              if (Array.isArray(msg.data?.panes)) {
+                // pane_content is authoritative current content — the connect
+                // seed, or the catch-up the server sends when a pane comes on
+                // screen (off-screen panes' output is no longer streamed).
+                // Output queued here for the same pane but not yet flushed was
+                // published before the server read that content, so it is
+                // already in it: flushing it after would print it twice.
+                for (const p of msg.data.panes) {
+                  if (p?.pane_id) delete pendingRef.current[p.pane_id];
+                }
+                store.applyPaneContentSeed(msg.data.panes);
+              }
               break;
             case 'pane_output': {
               const d = msg.data;
               if (d?.pane_id && d?.mode && typeof d.text === 'string' && d.text) {
                 if (!pendingRef.current[d.pane_id]) pendingRef.current[d.pane_id] = {};
+                // Capped as it accumulates: the store keeps only this tail of
+                // a pane's output anyway, so queueing more is pure garbage.
                 pendingRef.current[d.pane_id][d.mode] =
-                  (pendingRef.current[d.pane_id][d.mode] || '') + d.text;
+                  capTail((pendingRef.current[d.pane_id][d.mode] || '') + d.text);
                 // Chat chunks additionally queue turn-tagged for the Ask Rysh
                 // per-turn transcript (the flat buffer above still feeds the
                 // chat-mode pane view). '' = untagged legacy append.
@@ -111,10 +155,12 @@ export function useWebSocket() {
                   const q = pendingChatRef.current[d.pane_id] || (pendingChatRef.current[d.pane_id] = []);
                   const turnId = typeof d.turn_id === 'string' ? d.turn_id : '';
                   const last = q[q.length - 1];
-                  if (last && (turnId === '' || last.turnId === turnId)) last.text += d.text;
+                  if (last && (turnId === '' || last.turnId === turnId)) last.text = capTail(last.text + d.text);
                   else q.push({ turnId, text: d.text });
+                  // The transcript keeps at most MAX_CHAT_TURNS turns per pane.
+                  if (q.length > MAX_CHAT_TURNS) q.splice(0, q.length - MAX_CHAT_TURNS);
                 }
-                if (rafRef.current == null) rafRef.current = requestAnimationFrame(flushPending);
+                scheduleFlush();
               }
               break;
             }
@@ -125,6 +171,17 @@ export function useWebSocket() {
               // W7: reply to a completion_get this client sent (request/reply
               // over the same socket; correlated by request_id).
               resolveCompletionResult(msg.data || {});
+              break;
+            case 'meeting_token':
+              // Design 043: the daemon's answer to a meeting_token request
+              // from a livekit meeting pane. Handed straight to the waiting
+              // request — the token is never stored or logged here.
+              resolveMeetingToken(msg.data);
+              break;
+            case 'meeting_reply':
+              // MTG-6: the daemon's answer to a meeting panel's lifecycle verb
+              // (meeting_command), routed by the meeting id and verb it echoes.
+              resolveMeetingReply(msg.data);
               break;
             case 'board_result': {
               // The agents board (design 025/028): the answer to a board_get
@@ -248,6 +305,11 @@ export function useWebSocket() {
               if (msg.data?.humanoid_name && store.emailList[msg.data.humanoid_name] !== undefined) {
                 sendCommand('email_list', { humanoid_name: msg.data.humanoid_name });
               }
+              break;
+            case 'company_snapshot':
+              // The daemon's company follower pushed a fresh snapshot, or answered
+              // company_query (design 037).
+              if (msg.data?.snapshot) store.setCompanySnapshot(msg.data.snapshot);
               break;
             case 'whatsapp_list':
               if (msg.data?.humanoid_name) {
@@ -389,6 +451,9 @@ export function useWebSocket() {
 
     return () => {
       unmounted = true;
+      document.removeEventListener('visibilitychange', onVisibility);
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+      if (hiddenTimerRef.current != null) clearTimeout(hiddenTimerRef.current);
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       const ws = useStore.getState().ws;
       if (ws) ws.close();

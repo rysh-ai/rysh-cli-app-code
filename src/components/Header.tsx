@@ -1,7 +1,12 @@
-import { useState } from 'react';
+import { lazy, Suspense, useState } from 'react';
+import { FaceTimePanel } from './FaceTimePanel';
 import { useStore } from '../store';
+import { daemonTokenSource } from '../meeting/daemonToken';
 import { sendCommand, sendControlStatus } from '../utils/commands';
 import { TabBar, toggleTabOrientation, useTabBarVertical } from './TabBar';
+
+// LiveKit is large; load it only when a meeting is opened.
+const MeetingPanel = lazy(() => import('./MeetingPanel').then((m) => ({ default: m.MeetingPanel })));
 
 export function Header() {
   const workspaceName = useStore((s) => s.workspaceName);
@@ -110,6 +115,8 @@ function Toolbar() {
   const showSharePanel = useStore((s) => s.showSharePanel);
   const showDashboard = useStore((s) => s.showDashboard);
   const tabBarVertical = useTabBarVertical();
+  const [faceTimeOpen, setFaceTimeOpen] = useState(false);
+  const [meetingOpen, setMeetingOpen] = useState(false);
   const [bcOpen, setBcOpen] = useState(false);
   const [bcScope, setBcScope] = useState('tab');
   const [bcCmd, setBcCmd] = useState('');
@@ -183,6 +190,20 @@ function Toolbar() {
       >
         {tabBarVertical ? '▥' : '▤'}
       </span>
+      {window.electronAPI?.facetime && /Macintosh/.test(navigator.userAgent) && (
+        <button onClick={() => setFaceTimeOpen(true)} title="Contacts and FaceTime audio on this Mac"
+          className="px-2 py-0.5 rounded text-[11px] bg-[#333] hover:bg-[#444]">FaceTime</button>
+      )}
+      {faceTimeOpen && <FaceTimePanel onClose={() => setFaceTimeOpen(false)} />}
+      <button onClick={() => setMeetingOpen(true)} title="Join a rysh meeting room (LiveKit)"
+        className="px-2 py-0.5 rounded text-[11px] bg-[#333] hover:bg-[#444]">Meeting</button>
+      {/* Room ids get their token from the daemon (E-87): it holds the rysh
+          key and server; the app holds no account credential. */}
+      {meetingOpen && (
+        <Suspense fallback={null}>
+          <MeetingPanel onClose={() => setMeetingOpen(false)} tokenSource={daemonTokenSource} />
+        </Suspense>
+      )}
       {/* Broadcast a bash command across a scope (##cmd, rysh-cli 7b29e63) */}
       <div className="relative shrink-0">
         <span

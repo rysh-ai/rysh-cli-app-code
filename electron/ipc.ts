@@ -1,6 +1,6 @@
 import { ipcMain } from 'electron'
 import type { SidecarManager } from './sidecar'
-import type { WebPaneManager, WebPaneBounds, ImportCookie } from './webPaneManager'
+import type { WebPaneManager, WebPaneBounds, ImportCookie, WebPaneCreateOptions } from './webPaneManager'
 import type { WorkspaceManager } from './workspaceManager'
 import { readVoiceConfig, publicVoiceConfig, transcribeAudio } from './voice'
 import { getCompletions } from './completion'
@@ -15,6 +15,8 @@ export interface WorkspaceCallbacks {
   onRestartDaemon: () => Promise<{ success: boolean; error?: string }>
   /** Detach: leave the daemon running and quit the app (state preserved). */
   onDetachSession: () => { success: boolean; error?: string }
+  /** Company Connect (design 037): claim a code (deep link or pasted line) and open its workspace. */
+  onConnectCompany?: (link: string) => Promise<{ success: boolean; error?: string }>
 }
 
 /**
@@ -70,6 +72,11 @@ export function registerIpcHandlers(
     return workspaceCallbacks.onSelectWorkspace(dirPath)
   })
 
+  ipcMain.handle('connect-company', async (_event, link: string) => {
+    if (!workspaceCallbacks?.onConnectCompany) return { success: false, error: 'Company connect is not available' }
+    return workspaceCallbacks.onConnectCompany(String(link || ''))
+  })
+
   // Reload only the app UI (renderer); the daemon keeps running on the same port.
   ipcMain.handle('reload-app', () => {
     workspaceCallbacks?.onReloadApp()
@@ -119,8 +126,8 @@ export function registerIpcHandlers(
 
   // ── Web Pane Management ──
 
-  ipcMain.handle('web-pane-create', (_event, paneId: string, url: string, profile: string, bounds?: WebPaneBounds) => {
-    webPaneManager.create(paneId, url, profile, bounds)
+  ipcMain.handle('web-pane-create', (_event, paneId: string, url: string, profile: string, bounds?: WebPaneBounds, opts?: WebPaneCreateOptions) => {
+    webPaneManager.create(paneId, url, profile, bounds, { meeting: opts?.meeting === true })
     return { success: true }
   })
 

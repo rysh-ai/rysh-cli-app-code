@@ -66,7 +66,7 @@ export function Footer() {
       break;
     case 'layout':
       modeText = 'LAYOUT';
-      helpText = 'h/= equalize-width | v equalize-height | arrows resize | m maximize | s swap-lane | esc|. exit';
+      helpText = 'h/= equalize-width | v equalize-height | arrows resize | m maximize | s swap-lane | c collapse-lane | o open-all | esc|. exit';
       break;
     case 'resize':
       modeText = 'RESIZE';

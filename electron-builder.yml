@@ -2,6 +2,15 @@ appId: com.rysh.desktop
 productName: Rysh
 copyright: Copyright © 2024-2026 Rysh
 
+# Company Connect (design 037): the dashboard's "Connect the desktop app"
+# button opens rysh://connect?server=…&token=…. Registering the scheme here
+# puts x-scheme-handler/rysh in the Linux .desktop file and CFBundleURLTypes in
+# the mac Info.plist; main.ts claims it at runtime with setAsDefaultProtocolClient.
+protocols:
+  - name: Rysh
+    schemes:
+      - rysh
+
 directories:
   buildResources: resources
   output: release
@@ -47,7 +56,9 @@ mac:
   entitlements: resources/entitlements.mac.plist
   entitlementsInherit: resources/entitlements.mac.plist
   extendInfo:
-    NSMicrophoneUsageDescription: Rysh uses the microphone for voice prompting (speech-to-text).
+    NSContactsUsageDescription: Rysh lists your contacts so you can choose someone for a FaceTime audio call.
+    NSMicrophoneUsageDescription: Rysh uses the microphone for voice prompting (speech-to-text) and in meetings you join in a pane.
+    NSCameraUsageDescription: Rysh uses the camera only in meetings you join in a pane (Google Meet, Zoom, Teams or a rysh room).
   extraResources:
     # ${arch} is the arch of the artifact being built, so an arm64 dmg carries
     # only rysh-darwin-arm64. Matches resolveBinaryPath() in electron/sidecar.ts.
@@ -75,12 +86,26 @@ mac:
 # for exactly this reason. Re-enable here once ConPTY lands (design 011) —
 # resources/icon.ico is already generated and waiting.
 
+# E-94: Linux only (the hook returns early elsewhere) — puts
+# resources/linux/launcher.sh in front of the Electron binary so an AppImage on
+# a userns-restricted system explains itself instead of crashing in Chromium.
+afterPack: scripts/build/after-pack-linux-launcher.cjs
+
 linux:
   category: Development
   icon: resources/icon.png
   # Not `rysh`: the CLI package installs /usr/local/bin/rysh, and a desktop
   # package claiming the same command name would shadow it on PATH.
   executableName: rysh-desktop
+  # E-95: `--` (Chromium's switch terminator) is the only arg in every desktop
+  # entry's Exec=. Unset, electron-builder 25.1.8 writes `AppRun --no-sandbox %U`
+  # into the AppImage's .desktop (AppImageTarget.js: `executableArgs?.join(" ")
+  # || "--no-sandbox"`; an empty list falls back too). `--` is a no-op for the
+  # app and makes whatever %U expands to a positional argument, so a crafted
+  # rysh:// link can never be read as a Chromium switch. Do not put %U here:
+  # the AppImage target appends it unconditionally (it would appear twice); the
+  # .deb appends it too, because no field code is listed.
+  executableArgs: ["--"]
   # Required by the .deb (fpm) target as the package maintainer.
   maintainer: Rysh <info@rysh.ai>
   artifactName: ${productName}-${version}-linux-${arch}.${ext}
@@ -100,10 +125,20 @@ linux:
       to: tray-icon.png
     - from: resources/tray-icon@2x.png
       to: tray-icon@2x.png
+    # E-92: installed to /etc/apparmor.d by the .deb postinst (unused by the
+    # AppImage, which has no install step to load it).
+    - from: resources/linux/apparmor-profile
+      to: apparmor-profile
 
 deb:
   packageName: rysh-desktop
   artifactName: rysh-desktop_${version}_${arch}.deb
+  # E-92: the default postinst leaves chrome-sandbox 0755 on Ubuntu 24.04 (its
+  # userns probe runs as root, which AppArmor does not restrict), so the app
+  # aborts for every user. These replace electron-builder's templates — see the
+  # header of after-install.tpl for what they keep and what they add.
+  afterInstall: resources/linux/after-install.tpl
+  afterRemove: resources/linux/after-remove.tpl
 
 # Artifacts are served from Cloudflare R2 behind packages.rysh.ai — the same
 # bucket and CDN the CLI already publishes to. GitHub Releases is not an option:

@@ -1,3 +1,4 @@
+import type { FaceTimeAPI } from '../src/types/facetime'
 import { contextBridge, ipcRenderer } from 'electron'
 
 /**
@@ -25,6 +26,9 @@ export interface WorkspaceInfo {
 }
 
 export interface ElectronAPI {
+  facetime: FaceTimeAPI
+  /** Opens a meeting's report.md (E-81); the main process accepts only that file. */
+  openMeetingReport: (meetingId: string, path: string) => Promise<{ success: boolean; error?: string }>
   // App info
   getPort: () => Promise<number>
   getPlatform: () => Promise<string>
@@ -59,9 +63,17 @@ export interface ElectronAPI {
     removeChangedListener: () => void
   }
 
+  // Company Connect (design 037)
+  company: {
+    /** A rysh://connect link, or a pasted `ry connect …` / install line. */
+    connect: (link: string) => Promise<{ success: boolean; error?: string }>
+    onStatus: (callback: (status: { stage: 'claiming' | 'opening' | 'done' | 'error'; message: string }) => void) => void
+    removeStatusListener: () => void
+  }
+
   // Web pane management
   webPane: {
-    create: (paneId: string, url: string, profile: string, bounds?: { x: number; y: number; width: number; height: number }) => Promise<{ success: boolean }>
+    create: (paneId: string, url: string, profile: string, bounds?: { x: number; y: number; width: number; height: number }, opts?: { meeting?: boolean }) => Promise<{ success: boolean }>
     destroy: (paneId: string) => Promise<{ success: boolean }>
     detach: (paneId: string) => Promise<{ success: boolean }>
     syncAlive: (keepIds: string[]) => Promise<{ success: boolean }>
@@ -88,12 +100,20 @@ export interface ElectronAPI {
       canGoBack: boolean
       canGoForward: boolean
       loading: boolean
+      loadError?: { code: number; description: string; url: string }
     }) => void) => void
     removeStatusListener: () => void
   }
 }
 
 const api: ElectronAPI = {
+  facetime: {
+    doctor: () => ipcRenderer.invoke('facetime-doctor'),
+    contacts: (search, offset = 0) => ipcRenderer.invoke('facetime-contacts', search, offset),
+    call: (contactID, addressID, expectedValue) => ipcRenderer.invoke('facetime-call', contactID, addressID, expectedValue),
+    cancel: () => ipcRenderer.invoke('facetime-cancel'),
+  },
+  openMeetingReport: (meetingId, path) => ipcRenderer.invoke('meeting-open-report', meetingId, path),
   // App info
   getPort: () => ipcRenderer.invoke('get-sidecar-port'),
   getPlatform: () => ipcRenderer.invoke('get-platform'),
@@ -117,6 +137,16 @@ const api: ElectronAPI = {
     },
   },
 
+  company: {
+    connect: (link) => ipcRenderer.invoke('connect-company', link),
+    onStatus: (callback) => {
+      ipcRenderer.on('company-connect-status', (_event, status) => callback(status))
+    },
+    removeStatusListener: () => {
+      ipcRenderer.removeAllListeners('company-connect-status')
+    },
+  },
+
   // Voice prompting
   voice: {
     getConfig: () => ipcRenderer.invoke('voice-get-config'),
@@ -130,7 +160,7 @@ const api: ElectronAPI = {
 
   // Web pane management
   webPane: {
-    create: (paneId, url, profile, bounds) => ipcRenderer.invoke('web-pane-create', paneId, url, profile, bounds),
+    create: (paneId, url, profile, bounds, opts) => ipcRenderer.invoke('web-pane-create', paneId, url, profile, bounds, opts),
     detach: (paneId) => ipcRenderer.invoke('web-pane-detach', paneId),
     syncAlive: (keepIds) => ipcRenderer.invoke('web-pane-sync-alive', keepIds),
     destroy: (paneId) => ipcRenderer.invoke('web-pane-destroy', paneId),

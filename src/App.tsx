@@ -54,7 +54,9 @@ export default function App() {
       for (const lane of tab.lanes || [])
         for (const g of lane.pane_groups || [])
           for (const p of g.panes || [])
-            if (p.web_profile) keep.push(p.id);
+            // A web meeting pane (design 043) holds a native view too, bound by
+            // its meeting.* meta rather than a web profile.
+            if (p.web_profile || (p.pane_type === 'meeting' && p.meta?.['meeting.kind'] === 'web')) keep.push(p.id);
     window.electronAPI.webPane.syncAlive(keep);
   }, [snapshot]);
 

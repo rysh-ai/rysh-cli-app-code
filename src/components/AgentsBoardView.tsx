@@ -1,7 +1,21 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from '../store';
 import { sendCommand } from '../utils/commands';
-import type { BoardPost, BoardThread } from '../types';
+import { writeClipboard } from '../utils/clipboard';
+import {
+  buildCopy,
+  copySummary,
+  flattenBoard,
+  outputFileName,
+  renderBoardHTML,
+  sanitiseBody,
+  sanitiseInline,
+} from '../board/items';
+import { buildFlow, type FlowPane } from '../board/flow';
+import { countViews, DEFAULT_BOARD_VIEW, filterThreads, type BoardView } from '../board/views';
+import { BoardFlowView } from './BoardFlowView';
+import { BoardTeamView } from './BoardTeamView';
+import type { BoardData, BoardPost, BoardThread, WorkspaceSnapshot } from '../types';
 
 interface Props {
   paneId: string;
@@ -34,8 +48,22 @@ export const AgentsBoardView = React.memo(function AgentsBoardView({ paneId, boa
   const setBoardData = useStore((s) => s.setBoardData);
   const [showRoster, setShowRoster] = useState(false);
   const [unanswered, setUnanswered] = useState(false);
+  const [flash, setFlash] = useState('');
+  const [view, setView] = useState<BoardView>(DEFAULT_BOARD_VIEW);
+  const snapshot = useStore((s) => s.snapshot);
+  // The panes the flow names and chains (fleet.role / fleet.parent / fleet.comm
+  // live in pane meta, not on the board). Rebuilt only when the board answers
+  // or the layout changes, and only while the flow or team view is showing —
+  // the team table (design 054 §8b) reads the same model's ledger fields.
+  const flow = useMemo(
+    () => ((view === 'flow' || view === 'team') && data?.threads ? buildFlow(data.board || boardId, data.threads, snapshotPanes(snapshot)) : null),
+    [view, data, boardId, snapshot]
+  );
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true);
+  // The element each post rendered into, so Y and o can take "what is on
+  // screen" the way the TUI's board pane does (boardPaneItems).
+  const postEls = useRef(new Map<BoardPost, HTMLElement>());
 
   // Poll while mounted. The first fetch is immediate so opening the pane is not
   // a blank two seconds; PERIOD is a monitoring view's refresh, not a chat
@@ -135,8 +163,84 @@ export const AgentsBoardView = React.memo(function AgentsBoardView({ paneId, boa
     );
   }
 
-  const threads = data.threads || [];
+  const allThreads = data.threads || [];
+  const threads = filterThreads(allThreads, view);
+  const counts = countViews(allThreads);
   const roster = data.roster || [];
+
+  // ── y / Y / o (design 049): the TUI board pane's keys, as buttons too ──
+  //
+  // y copies the newest message, Y the messages on screen, o writes the
+  // on-screen messages as the shareable HTML page. All three go through the
+  // ported item model (board/items.ts), so the text is the same bytes
+  // `##board copy` produces. Nothing to copy is a refusal shown in the status
+  // line, never an empty clipboard.
+  const onScreen = (): BoardPost[] | null => {
+    const box = scrollRef.current?.getBoundingClientRect();
+    if (!box || box.height <= 0) return null; // not laid out: the whole window
+    const seen: BoardPost[] = [];
+    postEls.current.forEach((el, post) => {
+      const r = el.getBoundingClientRect();
+      if (r.bottom > box.top && r.top < box.bottom) seen.push(post);
+    });
+    return seen;
+  };
+  const visibleItems = (d: BoardData) => {
+    const seen = onScreen();
+    return seen ? flattenBoard(d, (p) => seen.includes(p)) : flattenBoard(d);
+  };
+
+  const copy = (visible: boolean) => {
+    const all = flattenBoard(data);
+    let res;
+    try {
+      res = buildCopy(visible ? visibleItems(data) : all, visible ? 0 : 1);
+    } catch (e) {
+      setFlash((e as Error).message);
+      return;
+    }
+    res.total = all.length; // "k of m" counts the whole board, as ##board copy does
+    const summary = copySummary(res);
+    void writeClipboard(res.text).then((ok) =>
+      setFlash(ok ? summary : '[board] clipboard error: this context would not let the page write the clipboard')
+    );
+  };
+
+  const output = () => {
+    const items = visibleItems(data);
+    if (items.length === 0) {
+      setFlash('[board] no messages');
+      return;
+    }
+    const now = new Date();
+    const board = data.board || boardId || 'session';
+    const page = renderBoardHTML({ board, picked: items, total: flattenBoard(data).length, now });
+    const url = URL.createObjectURL(new Blob([page], { type: 'text/html' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = outputFileName(board, now);
+    a.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 10000);
+    setFlash(`[board] wrote ${items.length} of ${flattenBoard(data).length} messages to ${a.download}`);
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const act = {
+      y: () => copy(false),
+      Y: () => copy(true),
+      o: output,
+      s: () => setView('status'),
+      p: () => setView('prompt'),
+      a: () => setView('all'),
+      f: () => setView('flow'),
+      t: () => setView('team'),
+    }[e.key];
+    if (!act) return;
+    e.preventDefault();
+    e.stopPropagation();
+    act();
+  };
 
   return (
     <BoardFrame
@@ -172,6 +276,32 @@ export const AgentsBoardView = React.memo(function AgentsBoardView({ paneId, boa
               </span>
             </>
           )}
+          <span className="text-[#666]">·</span>
+          {/* 051's views, 052's flow and 054's team: the same keys as the terminal's board pane. */}
+          {(
+            [
+              ['status', `${counts.status} status`],
+              ['prompt', `${counts.prompt} prompt`],
+              ['all', 'all'],
+              ['flow', 'flow'],
+              ['team', 'team'],
+            ] as const
+          ).map(([v, text]) => (
+            <button
+              key={v}
+              type="button"
+              onClick={() => setView(v)}
+              title={`show ${v} (${v[0]})`}
+              aria-pressed={view === v}
+              className={view === v ? 'text-white underline cursor-pointer' : 'text-[#8a8aaf] hover:text-white cursor-pointer'}
+            >
+              {text}
+            </button>
+          ))}
+          <span className="text-[#666]">·</span>
+          <BoardAction label="copy newest" keyHint="y" onClick={() => copy(false)} />
+          <BoardAction label="copy visible" keyHint="Y" onClick={() => copy(true)} />
+          <BoardAction label="HTML" keyHint="o" onClick={output} />
         </>
       }
     >
@@ -196,8 +326,23 @@ export const AgentsBoardView = React.memo(function AgentsBoardView({ paneId, boa
         </div>
       )}
 
-      <div ref={scrollRef} onScroll={onScroll} className="flex-1 min-h-0 overflow-y-auto px-3 py-2">
-        {threads.length === 0 ? (
+      <div
+        ref={scrollRef}
+        onScroll={onScroll}
+        onKeyDown={onKeyDown}
+        tabIndex={0}
+        className={`flex-1 min-h-0 outline-none ${view === 'flow' || view === 'team' ? 'flex flex-col overflow-hidden' : 'overflow-y-auto px-3 py-2'}`}
+      >
+        {view === 'flow' && flow ? (
+          <BoardFlowView flow={flow} now={data.fetchedAt} />
+        ) : view === 'team' && flow ? (
+          <BoardTeamView flow={flow} now={data.fetchedAt} />
+        ) : threads.length === 0 && allThreads.length > 0 ? (
+          <div className="text-[#808080] text-[12px]">
+            No {view} messages on this board — {view === 'status' ? `${counts.prompt} prompt` : `${counts.status} status`}{' '}
+            thread(s) are in the other view.
+          </div>
+        ) : threads.length === 0 ? (
           <div className="text-[#808080] text-[12px]">
             The recorder answered: this board is empty.
             <div className="mt-1 text-[#666]">
@@ -205,9 +350,14 @@ export const AgentsBoardView = React.memo(function AgentsBoardView({ paneId, boa
             </div>
           </div>
         ) : (
-          threads.map((t) => <Thread key={t.key} thread={t} />)
+          threads.map((t) => <Thread key={t.key} thread={t} els={postEls.current} />)
         )}
       </div>
+      {flash && (
+        <div className="px-3 py-0.5 border-t border-[#333] bg-[#1a1a1a] text-[11px] text-[#808080] shrink-0 truncate">
+          {flash}
+        </div>
+      )}
     </BoardFrame>
   );
 });
@@ -235,12 +385,27 @@ function BoardFrame({
   );
 }
 
-function Thread({ thread }: { thread: BoardThread }) {
+function BoardAction({ label, keyHint, onClick }: { label: string; keyHint: string; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={`${label} (${keyHint})`}
+      className="text-[#8a8aaf] hover:text-white cursor-pointer"
+    >
+      {label}
+    </button>
+  );
+}
+
+type PostEls = Map<BoardPost, HTMLElement>;
+
+function Thread({ thread, els }: { thread: BoardThread; els: PostEls }) {
   const replies = thread.replies || [];
   return (
     <div className="mb-3">
       {thread.root ? (
-        <Post post={thread.root} />
+        <Post post={thread.root} els={els} />
       ) : (
         // A provisional thread is EXPECTED, not an error: thread ids are minted
         // agent-side with no round trip (design 025 §4.3), so a reply can land
@@ -252,7 +417,7 @@ function Thread({ thread }: { thread: BoardThread }) {
       {replies.length > 0 && (
         <div className="ml-3 mt-1 border-l border-[#333] pl-3">
           {replies.map((r, i) => (
-            <Post key={`${r.pane_id}-${r.ts}-${i}`} post={r} reply />
+            <Post key={`${r.pane_id}-${r.ts}-${i}`} post={r} reply els={els} />
           ))}
         </div>
       )}
@@ -260,23 +425,45 @@ function Thread({ thread }: { thread: BoardThread }) {
   );
 }
 
-function Post({ post, reply }: { post: BoardPost; reply?: boolean }) {
+function Post({ post, reply, els }: { post: BoardPost; reply?: boolean; els?: PostEls }) {
+  const isCmd = post.kind === 'cmd' || post.kind === 'ack';
   return (
-    <div className={reply ? 'mb-1.5' : 'mb-1'}>
+    <div
+      className={reply ? 'mb-1.5' : 'mb-1'}
+      ref={(el) => {
+        if (!els) return;
+        if (el) els.set(post, el);
+        else els.delete(post);
+      }}
+    >
       <div className="flex items-baseline gap-1.5 text-[11px] flex-wrap">
         {!reply && <span className="text-[#87d7af]">●</span>}
         {/* title carries the pane id: persona is unique per LANE, not per
             session, so two agents can legitimately share this name and the id
             is the only way to tell them apart. */}
         <span className="text-[#87d7af] font-bold" title={post.pane_id}>
-          {post.persona}
+          {sanitiseInline(post.persona)}
         </span>
-        <span className="text-[#8a8aaf]">[{post.kind}]</span>
-        {post.to_persona && <span className="text-[#af87ff]">→ {post.to_persona}</span>}
+        <span className="text-[#8a8aaf]">[{sanitiseInline(post.kind)}]</span>
+        {/* On a cmd the recipient is the ADDRESS the courier delivers to
+            (design 050), not an @mention; the id names the pane when no
+            persona came with it. */}
+        {(post.to_persona || (isCmd && post.to_pane_id)) && (
+          <span className="text-[#af87ff]" title={post.to_pane_id}>
+            → {post.to_persona || post.to_pane_id!.slice(0, 8)}
+          </span>
+        )}
+        {isCmd && post.cmd_id && <span className="text-[#af8700]">#{post.cmd_id}</span>}
         <span className="text-[#666]">{formatTS(post.ts)}</span>
       </div>
+      {post.kind === 'cmd' && post.file && (
+        <div className="text-[#808080] text-[11px] break-all">
+          read in full: <code className="text-[#87d7af]">{post.file}</code>
+        </div>
+      )}
       <div className="text-[#d0d0d0] text-[12px] whitespace-pre-wrap break-words leading-snug">
-        {post.text}
+        {/* Agent-written: escapes stripped whole, as the terminal's board does. */}
+        {sanitiseBody(post.text)}
       </div>
     </div>
   );
@@ -295,4 +482,25 @@ function formatTS(ts: number): string {
   const d = new Date(ts);
   const p = (n: number) => String(n).padStart(2, '0');
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+// domain.PaneCanHostAnAgent: approval panes and the shell-less types. A board
+// pane carries board.id itself and would otherwise sit in its own flow as a
+// silent agent.
+const NO_AGENT_PANE_TYPES = new Set(['approval', 'replay', 'agents-board', 'meeting']);
+
+/** Every pane in the snapshot that can host an agent, as the flow model takes them. */
+export function snapshotPanes(snapshot: WorkspaceSnapshot | null): FlowPane[] {
+  const out: FlowPane[] = [];
+  for (const tab of snapshot?.tabs || []) {
+    for (const lane of tab.lanes || []) {
+      for (const g of lane.pane_groups || []) {
+        for (const p of g.panes || []) {
+          if (NO_AGENT_PANE_TYPES.has(p.pane_type || '')) continue;
+          out.push({ id: p.id, name: p.given_name || p.title, meta: p.meta });
+        }
+      }
+    }
+  }
+  return out;
 }

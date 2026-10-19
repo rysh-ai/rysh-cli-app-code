@@ -1,4 +1,4 @@
-import React, { forwardRef, useCallback, useRef } from 'react';
+import React, { forwardRef, useCallback, useEffect, useRef } from 'react';
 
 // TouchTermInput — soft-keyboard bridge for live interactive (VT) panes on
 // touch devices. Port of rysh-mobile's InteractiveTerminal mechanism: there,
@@ -19,8 +19,11 @@ import React, { forwardRef, useCallback, useRef } from 'react';
 //     and preventDefault'ed, same encoding as the desktop document handler.
 //   - IME input (Android Gboard sends key='Unidentified'/keyCode 229):
 //     beforeinput carries the text — insertText/insertLineBreak/
-//     deleteContentBackward are translated and preventDefault'ed, so the
-//     textarea stays empty. Composition (autocomplete, dead keys, CJK) is
+//     insertParagraph/deleteContentBackward are translated and
+//     preventDefault'ed, so the textarea stays empty. This must be a NATIVE listener: React's
+//     onBeforeInput is synthesized from compositionend/keypress/textInput/
+//     paste, none of which carry inputType, so a switch on it never matched
+//     and Android backspace/Enter were lost (F-75). Composition (autocomplete, dead keys, CJK) is
 //     left alone until compositionend, then the composed text is sent and
 //     the textarea cleared.
 //
@@ -47,6 +50,18 @@ function textToBytes(text: string): number[] {
 export const TouchTermInput = forwardRef<HTMLTextAreaElement, Props>(
   function TouchTermInput({ onBytes, keyToBytes }, ref) {
     const composingRef = useRef(false);
+    const elRef = useRef<HTMLTextAreaElement | null>(null);
+
+    // The textarea is needed internally (for the native listener) and by the
+    // caller (PaneBox focuses it from the tap handler), so feed both.
+    const setRefs = useCallback(
+      (el: HTMLTextAreaElement | null) => {
+        elRef.current = el;
+        if (typeof ref === 'function') ref(el);
+        else if (ref) ref.current = el;
+      },
+      [ref]
+    );
 
     const sendText = useCallback(
       (text: string) => {
@@ -85,22 +100,27 @@ export const TouchTermInput = forwardRef<HTMLTextAreaElement, Props>(
     );
 
     const handleBeforeInput = useCallback(
-      (e: React.FormEvent<HTMLTextAreaElement>) => {
-        const ie = e.nativeEvent as InputEvent;
+      (ie: InputEvent) => {
         if (composingRef.current || ie.isComposing) return;
         switch (ie.inputType) {
           case 'insertText':
           case 'insertFromPaste':
-          case 'insertFromDrop':
-            e.preventDefault();
-            sendText(ie.data ?? '');
+          case 'insertFromDrop': {
+            // Paste/drop may carry the text in dataTransfer rather than data.
+            // With no text found, let it land and the onInput drain send it.
+            const text = ie.data ?? ie.dataTransfer?.getData('text/plain') ?? '';
+            if (!text) break;
+            ie.preventDefault();
+            sendText(text);
             break;
+          }
           case 'insertLineBreak':
-            e.preventDefault();
+          case 'insertParagraph':
+            ie.preventDefault();
             onBytes([13], { kind: 'other' });
             break;
           case 'deleteContentBackward':
-            e.preventDefault();
+            ie.preventDefault();
             onBytes([127], { kind: 'backspace' });
             break;
           default:
@@ -110,6 +130,13 @@ export const TouchTermInput = forwardRef<HTMLTextAreaElement, Props>(
       },
       [onBytes, sendText]
     );
+
+    useEffect(() => {
+      const el = elRef.current;
+      if (!el) return;
+      el.addEventListener('beforeinput', handleBeforeInput);
+      return () => el.removeEventListener('beforeinput', handleBeforeInput);
+    }, [handleBeforeInput]);
 
     // Safety net: anything that still landed in the textarea (browsers that
     // skip beforeinput for some paths) is drained, sent, and cleared.
@@ -140,7 +167,7 @@ export const TouchTermInput = forwardRef<HTMLTextAreaElement, Props>(
 
     return (
       <textarea
-        ref={ref}
+        ref={setRefs}
         // Visually hidden but focusable. Not display:none / visibility:hidden
         // (unfocusable) and not width 0 (iOS refuses the keyboard). 16px font
         // prevents the iOS focus-zoom.
@@ -163,7 +190,6 @@ export const TouchTermInput = forwardRef<HTMLTextAreaElement, Props>(
         autoComplete="off"
         spellCheck={false}
         onKeyDown={handleKeyDown}
-        onBeforeInput={handleBeforeInput}
         onInput={handleInput}
         onCompositionStart={handleCompositionStart}
         onCompositionEnd={handleCompositionEnd}

@@ -1,6 +1,7 @@
 import { create } from 'zustand';
-import type { WorkspaceSnapshot, TabSnapshot, PaneSnapshot, PaneSeed, PendingApproval, AppMode, InputMode, WebPaneStatus, WebEnv, WebPaneFrame, BoardData, ClipboardContent, AgentInfo, HumanoidInfo, ShareInfo, EmailSummary, EmailDetail, WhatsAppMsgSummary, WhatsAppMsgDetail, PairingState, PairingQR, PairingStatusInfo, DashboardTab, PendingPair } from './types';
+import type { WorkspaceSnapshot, TabSnapshot, PaneSnapshot, PaneSeed, PendingApproval, AppMode, InputMode, WebPaneStatus, WebEnv, WebPaneFrame, BoardData, ClipboardContent, AgentInfo, HumanoidInfo, ShareInfo, EmailSummary, EmailDetail, CompanySnapshot, WhatsAppMsgSummary, WhatsAppMsgDetail, PairingState, PairingQR, PairingStatusInfo, DashboardTab, PendingPair } from './types';
 import { FIXED_INPUT_MODES } from './types';
+import { openLanes } from './utils/lanes';
 
 // Tracks the last-seen web_profile per pane so setSnapshot can auto-activate web
 // mode exactly when a pane's web binding first appears (##mode new web) — without
@@ -59,7 +60,9 @@ export function findPane(snapshot: WorkspaceSnapshot | null, paneId: string): Pa
 // "the daemon simply moved its own focus somewhere else".
 function visiblePaneIDs(tab: TabSnapshot): Set<string> {
   const ids = new Set<string>();
-  for (const lane of tab.lanes || []) {
+  // A folded lane's panes are not on screen (design 053), so focus there falls
+  // back to the daemon's, which setLaneCollapsed has already moved off it.
+  for (const lane of openLanes(tab)) {
     for (const g of lane.pane_groups || []) {
       for (const p of g.panes || []) ids.add(p.id);
     }
@@ -166,12 +169,74 @@ export type PaneVTBuf = {
 const MAX_PANE_CONTENT = 20000;
 // Ask Rysh transcript: max retained AI turns per pane. Older turns are dropped
 // whole (bumping the pane's chatTurns.base) so live turn indices never shift.
-const MAX_CHAT_TURNS = 200;
-function capTail(s: string): string {
+export const MAX_CHAT_TURNS = 200;
+export function capTail(s: string): string {
   if (s.length <= MAX_PANE_CONTENT) return s;
   const t = s.slice(s.length - MAX_PANE_CONTENT);
   const i = t.indexOf('\n');
   return i >= 0 && i < t.length - 1 ? t.slice(i + 1) : t;
+}
+
+// Per-pane client state was never dropped when a pane closed: a full,
+// content-carrying snapshot reseeds paneContent/paneVT, but a stream client
+// only ever receives layout-only snapshots, and every other per-pane map just
+// kept growing. Each append copies these maps, so a session that had seen
+// hundreds of panes over its days paid for all of them on every message.
+// pruneClosedPanes drops entries for panes absent from TWO consecutive
+// complete snapshots — once is not enough, because a pane's first output can
+// arrive before the layout snapshot that lists it, and a stream client that
+// dropped it would never see that output again.
+const absentOnce = new Set<string>();
+
+function snapshotPaneIds(s: WorkspaceSnapshot): { panes: Set<string>; tabs: Set<string>; complete: boolean } {
+  const panes = new Set<string>();
+  const tabs = new Set<string>();
+  let complete = true;
+  for (const tab of s.tabs || []) {
+    tabs.add(tab.id);
+    if (tab.partial) complete = false;
+    for (const lane of tab.lanes || []) {
+      for (const g of lane.pane_groups || []) {
+        for (const p of g.panes || []) panes.add(p.id);
+      }
+    }
+  }
+  return { panes, tabs, complete };
+}
+
+// withoutKeys returns obj minus the given keys, or obj itself when none of
+// them is present (so an unchanged map keeps its identity).
+function withoutKeys<T>(obj: Record<string, T>, drop: Set<string>): Record<string, T> {
+  let out: Record<string, T> | null = null;
+  for (const k of Object.keys(obj)) {
+    if (!drop.has(k)) continue;
+    if (!out) out = { ...obj };
+    delete out[k];
+  }
+  return out ?? obj;
+}
+
+// closedPaneIds returns the pane ids (and tab ids) whose state may be dropped
+// given snapshot s, updating the two-strikes bookkeeping. Empty for a
+// snapshot with a partial tab.
+function closedPaneIds(s: WorkspaceSnapshot, known: string[]): { panes: Set<string>; tabs: Set<string> } {
+  const { panes, tabs, complete } = snapshotPaneIds(s);
+  const closedPanes = new Set<string>();
+  const closedTabs = new Set<string>();
+  if (!complete) return { panes: closedPanes, tabs: closedTabs };
+  for (const id of known) {
+    if (panes.has(id)) {
+      absentOnce.delete(id);
+    } else if (absentOnce.has(id)) {
+      closedPanes.add(id);
+      absentOnce.delete(id);
+    } else {
+      absentOnce.add(id);
+    }
+  }
+  for (const id of absentOnce) if (panes.has(id)) absentOnce.delete(id);
+  for (const id of Object.keys(useStore.getState().pipelineOutputs)) if (!tabs.has(id)) closedTabs.add(id);
+  return { panes: closedPanes, tabs: closedTabs };
 }
 
 // seedContent extracts per-pane content + VT from a full snapshot (used to seed
@@ -336,6 +401,9 @@ interface AppStore {
   emailLoading: Record<string, boolean>;
   emailError: Record<string, string>;
   emailSelectedUID: Record<string, number | null>;
+  // Company Connect (design 037): the bound company's latest snapshot, pushed
+  // by the daemon's follower (company_snapshot). null = nothing received yet.
+  companySnapshot: CompanySnapshot | null;
   // Whether the in-view "Ask the bot" AI dock is open per pane. Undefined ⇒ open
   // (shown by default the first time); an explicit false is remembered across
   // input-mode cycling (which remounts the view). Mirrors webChatOpen.
@@ -444,6 +512,7 @@ interface AppStore {
   setEmailLoading: (humanoid: string, loading: boolean) => void;
   setEmailError: (humanoid: string, err: string) => void;
   setEmailSelectedUID: (paneId: string, uid: number | null) => void;
+  setCompanySnapshot: (snapshot: CompanySnapshot | null) => void;
   setEmailChatOpen: (paneId: string, open: boolean) => void;
   setWhatsAppList: (humanoid: string, messages: WhatsAppMsgSummary[]) => void;
   setWhatsAppDetail: (humanoid: string, message: WhatsAppMsgDetail) => void;
@@ -538,6 +607,7 @@ export const useStore = create<AppStore>((set, get) => ({
   emailLoading: {},
   emailError: {},
   emailSelectedUID: {},
+  companySnapshot: null,
   emailChatOpen: {},
   whatsappList: {},
   whatsappDetails: {},
@@ -666,14 +736,42 @@ export const useStore = create<AppStore>((set, get) => ({
     // the daemon does not get to move this window's cursor on its own.
     const focus = resolveFocus(s, focusedPaneID, followDaemonUntil, Date.now());
 
+    // Drop state of panes (and tabs) that have closed — see closedPaneIds.
+    const st = get();
+    const known = new Set<string>([
+      ...Object.keys(paneContent), ...Object.keys(paneVT), ...Object.keys(st.paneHistory),
+      ...Object.keys(st.webPaneFrames), ...Object.keys(st.chatTurns), ...Object.keys(nextModes),
+    ]);
+    const closed = closedPaneIds(s, [...known]);
+    for (const id of closed.panes) {
+      lastWebProfile.delete(id);
+      lastWebActivateSeq.delete(id);
+      webActivatedAt.delete(id);
+    }
+    const prune = <T,>(m: Record<string, T>) => withoutKeys(m, closed.panes);
+
     set({
       snapshot: s,
-      paneContent,
-      paneVT,
+      paneContent: prune(paneContent),
+      paneVT: prune(paneVT),
       paneEcho: nextEcho,
-      paneInputModes: nextModes,
+      paneInputModes: prune(nextModes),
       focusedPaneID: focus.focusedPaneID,
       followDaemonUntil: focus.followDaemonUntil,
+      ...(closed.panes.size > 0 ? {
+        paneHistory: prune(st.paneHistory),
+        paneInputTexts: prune(st.paneInputTexts),
+        paneScrollLocked: prune(st.paneScrollLocked),
+        paneHistoryIdx: prune(st.paneHistoryIdx),
+        paneHistorySaved: prune(st.paneHistorySaved),
+        paneHistoryPrefix: prune(st.paneHistoryPrefix),
+        panePendingCmd: prune(st.panePendingCmd),
+        webPaneFrames: prune(st.webPaneFrames),
+        webPaneErrors: prune(st.webPaneErrors),
+        chatTurns: prune(st.chatTurns),
+        browserTurns: prune(st.browserTurns),
+      } : {}),
+      ...(closed.tabs.size > 0 ? { pipelineOutputs: withoutKeys(st.pipelineOutputs, closed.tabs) } : {}),
     });
   },
 
@@ -875,7 +973,8 @@ export const useStore = create<AppStore>((set, get) => ({
     set((state) => ({
       pipelineOutputs: {
         ...state.pipelineOutputs,
-        [tabId]: (state.pipelineOutputs[tabId] || '') + text,
+        // Capped like pane output; it used to grow for as long as the tab lived.
+        [tabId]: capTail((state.pipelineOutputs[tabId] || '') + text),
       },
     })),
 
@@ -940,6 +1039,8 @@ export const useStore = create<AppStore>((set, get) => ({
 
   setWebChatOpen: (paneId, open) =>
     set((state) => ({ webChatOpen: { ...state.webChatOpen, [paneId]: open } })),
+
+  setCompanySnapshot: (snapshot) => set({ companySnapshot: snapshot }),
 
   setEmailList: (humanoid, emails) =>
     set((state) => ({

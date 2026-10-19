@@ -15,7 +15,7 @@ export default defineConfig({
     environment: 'jsdom',
     globals: true,
     setupFiles: ['./src/test/setup.ts'],
-    include: ['src/**/*.test.{ts,tsx}'],
+    include: ['src/**/*.test.{ts,tsx}', 'electron/facetime.test.ts', 'electron/meetingPermissions.test.ts', 'electron/meetingZoomTeams.test.ts', 'electron/webPaneBootstrap.test.ts', 'electron/webPaneLoadError.test.ts', 'electron/webPanePermissions.test.ts', 'electron/instanceManager.test.ts', 'electron/defaultWorkspace.test.ts', 'electron/meetingReport.test.ts', 'electron/sidecarQuit.test.ts', 'scripts/verify/*.test.ts'],
     restoreMocks: true,
   },
 });

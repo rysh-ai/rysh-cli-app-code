@@ -1,6 +1,9 @@
+import { useRef } from 'react';
 import { useStore, type PaneContentBuf, type PaneVTBuf } from '../store';
 import { sendCommand } from '../utils/commands';
 import { PaneBox } from './PaneBox';
+import { LaneStrip } from './LaneStrip';
+import { isLaneFolded, openLanes } from '../utils/lanes';
 import type { TabSnapshot, PaneSnapshot, LaneSnapshot, ConversationMessage, InputMode } from '../types';
 
 // rehydratePane merges streamed per-pane content/VT (content plane, ?stream=1)
@@ -96,6 +99,31 @@ export function resolveOutput(
   return pane.output || '';
 }
 
+// paneRenderCache memoizes the props Body hands each PaneBox. Body subscribes to
+// the whole paneContent / paneVT maps, so output from ANY pane in the session —
+// on any tab — re-renders Body; and it used to rebuild every pane's props on
+// each of those renders (a fresh rehydrated pane object, a fresh conversation
+// array), which defeated PaneBox's React.memo: every visible pane re-rendered
+// and re-parsed its output on every chunk from anywhere. The cost grew with
+// the panes a session accumulates over days. A pane's props are now rebuilt
+// only when something they are derived from changed; the store replaces only
+// the changed pane's buffers, so the others keep their identity and are skipped.
+type PaneRender = { pane: PaneSnapshot; conversationMessages?: ConversationMessage[] };
+type PaneRenderEntry = { deps: unknown[]; value: PaneRender };
+
+export function memoPaneRender(
+  cache: Map<string, PaneRenderEntry>,
+  key: string,
+  deps: unknown[],
+  build: () => PaneRender,
+): PaneRender {
+  const e = cache.get(key);
+  if (e && e.deps.length === deps.length && e.deps.every((d, i) => Object.is(d, deps[i]))) return e.value;
+  const value = build();
+  cache.set(key, { deps, value });
+  return value;
+}
+
 // lastExpandedByGroup remembers each stack group's expanded (active) pane so a
 // degraded snapshot that omits the group's active id keeps the same card
 // expanded instead of reshuffling the deck (see the sticky-card logic below).
@@ -119,6 +147,7 @@ export function Body() {
   const paneContent = useStore((s) => s.paneContent);
   const paneVT = useStore((s) => s.paneVT);
   const sidecarPort = useStore((s) => s.sidecarPort);
+  const renderCache = useRef(new Map<string, PaneRenderEntry>()).current;
 
   if (!snapshot?.tabs) {
     // No sidecar port in Electron => no active session (e.g. after Detach).
@@ -139,8 +168,14 @@ export function Body() {
     return <div className="flex-1 flex items-center justify-center text-[#555] p-5">no panes</div>;
   }
 
-  // Merge snapshot pipeline output with real-time pipeline output from WebSocket events
-  const effectivePipelineOutput = (tab.pipeline_output || '') + (pipelineOutputs[tab.id] || '');
+  // Merge snapshot pipeline output with real-time pipeline output from WebSocket
+  // events. Only when a pipeline is running: resolveOutput ignores it otherwise,
+  // and this concatenation used to run on every render (every output event).
+  const effectivePipelineOutput = tab.pipeline_active
+    ? (tab.pipeline_output || '') + (pipelineOutputs[tab.id] || '')
+    : '';
+  // Entries for panes not rendered this pass are dropped at the end of it.
+  const rendered = new Set<string>();
 
   // Fullscreen mode
   if (fullscreenPaneID) {
@@ -168,9 +203,15 @@ export function Body() {
     setFullscreenPaneID(null);
   }
 
-  return (
+  const openCount = openLanes(tab).length;
+  const body = (
     <div className="flex-1 flex overflow-hidden p-1 gap-1">
       {tab.lanes.map((lane: LaneSnapshot) => {
+        // A folded lane draws as a strip and gives its width to the open
+        // lanes (design 053). Its panes are not rendered at all.
+        if (isLaneFolded(tab, lane)) {
+          return <LaneStrip key={lane.id} tab={tab} lane={lane} activePaneId={effectiveActiveID || ''} />;
+        }
         // Lane name (rysh-cli f59e26c): falls back to the tab's pipeline name.
         // Rendered once, on the first visible (expanded) pane of the lane.
         const laneName = lane.name || tab.pipeline_name || '';
@@ -234,10 +275,15 @@ export function Body() {
                   if (pane.id !== activeId) {
                     // Collapsed (background) stacked pane: single title bar
                     // line at its stable position in the stack.
+                    const ckey = pane.id + ':collapsed';
+                    rendered.add(ckey);
+                    const collapsed = memoPaneRender(renderCache, ckey, [pane, stackTotal, stackPosition], () => ({
+                      pane: { ...pane, stack_total: stackTotal, stack_position: stackPosition, stack_collapsed: true },
+                    }));
                     return (
                       <PaneBox
                         key={pane.id}
-                        pane={{ ...pane, stack_total: stackTotal, stack_position: stackPosition, stack_collapsed: true }}
+                        pane={collapsed.pane}
                         isActive={pane.id === effectiveActiveID}
                         inputMode={getInputMode(pane.id)}
                         pipelineActive={false}
@@ -249,16 +295,26 @@ export function Body() {
 
                   // Expanded (visible) pane: full rendering, in place.
                   // Rehydrate streamed content/VT (content plane) first.
-                  const rpane = rehydratePane(pane, paneContent[pane.id], paneVT[pane.id]);
                   const activeIsFocused = pane.id === effectiveActiveID;
                   const activeInputMode = getInputMode(pane.id);
                   const pipelineActive = !!tab.pipeline_active && activeIsFocused;
-                  const conversationMessages = buildConversationMessages(rpane, activeInputMode);
-                  const output = resolveOutput(rpane, activeInputMode, pipelineActive, effectivePipelineOutput);
-                  let paneForBox = isStacked
-                    ? { ...rpane, stack_total: stackTotal, stack_position: stackPosition, stack_collapsed: false }
-                    : rpane;
-                  if (output !== paneForBox.output) paneForBox = { ...paneForBox, output };
+                  rendered.add(pane.id);
+                  const { pane: paneForBox, conversationMessages } = memoPaneRender(
+                    renderCache,
+                    pane.id,
+                    [pane, paneContent[pane.id], paneVT[pane.id], activeInputMode, pipelineActive,
+                      pipelineActive ? effectivePipelineOutput : '', isStacked, stackTotal, stackPosition],
+                    () => {
+                      const rpane = rehydratePane(pane, paneContent[pane.id], paneVT[pane.id]);
+                      const conversationMessages = buildConversationMessages(rpane, activeInputMode);
+                      const output = resolveOutput(rpane, activeInputMode, pipelineActive, effectivePipelineOutput);
+                      let paneForBox = isStacked
+                        ? { ...rpane, stack_total: stackTotal, stack_position: stackPosition, stack_collapsed: false }
+                        : rpane;
+                      if (output !== paneForBox.output) paneForBox = { ...paneForBox, output };
+                      return { pane: paneForBox, conversationMessages };
+                    },
+                  );
 
                   return (
                     <PaneBox
@@ -279,18 +335,32 @@ export function Body() {
           {/* New pane at the bottom of this lane (##new pane / ctrl+p v).
               Focus the lane first so the split-down targets it; both commands
               go to the workspace inbox in order, so focus is applied first. */}
-          <button
-            onClick={() => {
-              if (lane.active_pane_id) {
-                sendCommand('focus_pane_by_id', { id: lane.active_pane_id });
-              }
-              sendCommand('create_pane_down');
-            }}
-            title="New pane below in this lane (##new pane)"
-            className="shrink-0 py-0.5 rounded text-[11px] text-[#666] hover:text-[#9a9aaf] hover:bg-[#2a2a2a] border border-dashed border-[#3a3a3a] hover:border-[#5a5a7a] select-none"
-          >
-            + pane
-          </button>
+          <div className="shrink-0 flex gap-1">
+            <button
+              onClick={() => {
+                if (lane.active_pane_id) {
+                  sendCommand('focus_pane_by_id', { id: lane.active_pane_id });
+                }
+                sendCommand('create_pane_down');
+              }}
+              title="New pane below in this lane (##new pane)"
+              className="flex-1 py-0.5 rounded text-[11px] text-[#666] hover:text-[#9a9aaf] hover:bg-[#2a2a2a] border border-dashed border-[#3a3a3a] hover:border-[#5a5a7a] select-none"
+            >
+              + pane
+            </button>
+            {/* Fold this lane to a strip (##lane collapse). The last open lane
+                cannot fold — the daemon refuses it — so the control is hidden. */}
+            {openCount > 1 && (
+              <button
+                onClick={() => sendCommand('lane_collapse', { verb: 'collapse', lane: lane.id })}
+                title="Collapse this lane to a strip (##lane collapse)"
+                aria-label="collapse lane"
+                className="px-1.5 py-0.5 rounded text-[11px] text-[#666] hover:text-[#9a9aaf] hover:bg-[#2a2a2a] border border-dashed border-[#3a3a3a] hover:border-[#5a5a7a] select-none"
+              >
+                ⇥
+              </button>
+            )}
+          </div>
         </div>
         );
       })}
@@ -304,4 +374,10 @@ export function Body() {
       </div>
     </div>
   );
+  // Forget panes that were closed or moved off this tab, so the cache holds
+  // only what is on screen.
+  for (const key of renderCache.keys()) {
+    if (!rendered.has(key)) renderCache.delete(key);
+  }
+  return body;
 }

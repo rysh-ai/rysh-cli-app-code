@@ -19,6 +19,9 @@ export interface WorkspaceSnapshot {
 
 export interface TabSnapshot {
   id: string;
+  // Set by the daemon when this tab's snapshot did not arrive in time: its
+  // lanes are then empty, so absence of a pane from it proves nothing.
+  partial?: boolean;
   title: string;
   lanes: LaneSnapshot[];
   active_pane_id: string;
@@ -32,6 +35,8 @@ export interface LaneSnapshot {
   id: string;
   flex: number;
   name?: string; // lane name; defaults to the tab's pipeline name
+  // Folded to a strip (rysh-cli design 053); omitted when open.
+  collapsed?: boolean;
   pane_groups: PaneGroupSnapshot[];
   active_pane_id: string;
 }
@@ -336,6 +341,8 @@ export interface WebPaneStatus {
   canGoBack: boolean;
   canGoForward: boolean;
   loading: boolean;
+  /** The main frame's last load failure (electron/webPaneLoadError.ts); cleared when a navigation commits. */
+  loadError?: { code: number; description: string; url: string };
 }
 
 // WebEnv is the server-reported environment for the WEB (browser) build,
@@ -386,12 +393,17 @@ export interface BoardPost {
   pane_id: string;
   /** Display name only; two panes in different lanes may share one. */
   persona: string;
-  kind: string; // free-form: milestone, task-done, blocked, reply, or an agent's own
+  kind: string; // free-form: milestone, task-done, blocked, reply, cmd, ack, or an agent's own
   text: string;
   thread_id?: string;
   ts: number; // unix millis, the POSTER's clock — arrival order, not causal order
+  /** On a `cmd` these are the ADDRESS (design 050); on every other kind, chat. */
   to_persona?: string;
   to_pane_id?: string;
+  /** Names a `cmd`, and on an `ack` the command acknowledged (design 050). */
+  cmd_id?: string;
+  /** An absolute path the recipient of a `cmd` must read in full. */
+  file?: string;
 }
 
 export interface BoardThread {
@@ -478,4 +490,124 @@ export interface PaneSeed {
   remote_vt_screen?: string[];
   remote_vt_cursor_row?: number;
   remote_vt_cursor_col?: number;
+}
+
+// --- Company Connect (design 037) ---
+// The daemon's CompanyActor keeps one snapshot of the AI-native company this
+// session is bound to and pushes it on company.snapshot; the web server
+// forwards it as the `company_snapshot` message. Mirrors rysh-cli
+// internal/msg/company_messages.go — the JSON tags there are the contract.
+export interface CompanyInfo {
+  id: string;
+  workspace_id: string;
+  name: string;
+  slug: string;
+  fqdn: string;
+  status: string;
+  template_id: string;
+  server_url?: string;
+  site_url?: string;
+}
+
+export interface CompanyOrderLine {
+  sku: string;
+  name: string;
+  quantity: number;
+  unit_pence: number;
+  total_pence: number;
+}
+
+export interface CompanyOrder {
+  id: string;
+  reference: string;
+  customer_name: string;
+  customer_phone: string;
+  customer_email: string;
+  fulfilment: string;
+  address: string;
+  notes: string;
+  items: CompanyOrderLine[] | null;
+  amount_pence: number;
+  currency: string;
+  status: string;
+  payment_status: string;
+  created_at: string;
+}
+
+export interface CompanyEnquiry {
+  id: string;
+  reference: string;
+  kind: string;
+  subject: string;
+  name: string;
+  phone: string;
+  email: string;
+  message: string;
+  fields: string;
+  status: string;
+  owner_note: string;
+  created_at: string;
+}
+
+export interface CompanyEmail {
+  address: string;
+  incoming_email_address: string;
+  outgoing_email_address: string;
+  reply_address: string;
+  state: string;
+  last_error?: string;
+}
+
+export interface CompanyPhone {
+  number: string;
+  state: string;
+  message: string;
+}
+
+export interface CompanyService {
+  service_key: string;
+  state: string;
+  status_message: string;
+  next_action?: string;
+  monthly_cost_minor: number;
+  currency: string;
+}
+
+export interface CompanyChannel {
+  channel: string;
+  enabled: boolean;
+  state: string;
+  status_message: string;
+  credentials_required: string[] | null;
+}
+
+export interface CompanyActivity {
+  kind: string;
+  action: string;
+  id: string;
+  reference: string;
+  status: string;
+  summary: string;
+  occurred_at: string;
+}
+
+export interface CompanyLink {
+  connected: boolean;
+  live: boolean;
+  auth_failed: boolean;
+  last_error?: string;
+  last_fetch: string;
+}
+
+export interface CompanySnapshot {
+  company: CompanyInfo;
+  orders: CompanyOrder[] | null;
+  enquiries: CompanyEnquiry[] | null;
+  email?: CompanyEmail | null;
+  phone?: CompanyPhone | null;
+  services: CompanyService[] | null;
+  channels: CompanyChannel[] | null;
+  activity: CompanyActivity[] | null;
+  link: CompanyLink;
+  fetched_at: string;
 }

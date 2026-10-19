@@ -4,6 +4,7 @@ import { sendCommand } from '../utils/commands';
 import { voice } from '../utils/voice';
 import { paneShowsLiveApp } from '../utils/paneView';
 import { submitApproval } from '../utils/approvals';
+import { laneOfPane } from '../utils/lanes';
 
 /**
  * Global keyboard handler — mirrors the TUI keybindings exactly.
@@ -29,6 +30,16 @@ export function useKeyboard() {
 
       // ── Approval mode ──
       if (store.mode === 'approval') {
+        // ask_user's question is typed into, not approved (F-92): the gate
+        // keys would send Approve on the first "y" of an answer. Keys reach
+        // the overlay's answer field; only Escape (decline) is handled here.
+        if (store.pendingApproval?.request.type === 'question') {
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            submitApproval('no');
+          }
+          return;
+        }
         e.preventDefault();
         handleApprovalMode(e);
         return;
@@ -480,6 +491,18 @@ function handleLayoutMode(e: KeyboardEvent) {
     // Swap active lane with next
     case 's':
       sendCommand('swap_pane'); break;
+    // Fold the focused pane's lane to a strip / open every folded lane — the
+    // TUI's ctrl+l c / o (design 053). The lane is named by id: this window's
+    // focus is its own, not necessarily the daemon's active lane.
+    case 'c': {
+      const s = store.snapshot;
+      const tab = s?.tabs?.find((t) => t.id === s.active_tab_id) || s?.tabs?.[0];
+      const lane = tab ? laneOfPane(tab, store.getEffectiveActivePaneID() || '') : undefined;
+      sendCommand('lane_collapse', { verb: 'collapse', lane: lane?.id || '' });
+      break;
+    }
+    case 'o':
+      sendCommand('lane_collapse', { verb: 'expand', lane: 'all' }); break;
     // Toggle fullscreen, then LEAVE layout mode — same as the TUI's ctrl+l m
     // (rysh-cli internal/tui/model_update.go sets modeNormal before toggling).
     // Returning to normal mode is what hands the keyboard back to the pane:

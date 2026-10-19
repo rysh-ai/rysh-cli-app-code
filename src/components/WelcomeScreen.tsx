@@ -16,6 +16,30 @@ export function WelcomeScreen() {
   const [recent, setRecent] = useState<RecentWorkspace[]>([]);
   const [opening, setOpening] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Company Connect (design 037): the code from the company page, pasted in
+  // any of its forms (rysh:// link, `ry connect …`, the install line).
+  const [connectText, setConnectText] = useState('');
+  const [connectStatus, setConnectStatus] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+  useEffect(() => {
+    const api = window.electronAPI?.company;
+    api?.onStatus((s) => {
+      setConnectStatus(s.message);
+      if (s.stage === 'done' || s.stage === 'error') setConnecting(false);
+    });
+    return () => api?.removeStatusListener();
+  }, []);
+  async function connectCompany() {
+    if (connecting || !connectText.trim()) return;
+    setConnecting(true);
+    setConnectStatus('Connecting…');
+    try {
+      const res = await window.electronAPI?.company.connect(connectText);
+      if (res && !res.success && res.error) setConnectStatus(res.error);
+    } finally {
+      setConnecting(false);
+    }
+  }
 
   useEffect(() => {
     window.electronAPI?.workspace
@@ -59,6 +83,33 @@ export function WelcomeScreen() {
           >
             Open Workspace…
           </button>
+          <div className="mb-6 rounded border border-[#2a2a2a] p-3">
+            <div className="text-[11px] uppercase tracking-wider text-[#666] mb-2">
+              Have a company connect code?
+            </div>
+            <div className="text-[12px] text-[#8a8a8a] mb-2">
+              Paste the link or the <span className="font-mono text-[#aaa]">ry connect…</span> line from the
+              company page on the dashboard. This machine gets a read-only key for that company only.
+            </div>
+            <div className="flex gap-2">
+              <input
+                value={connectText}
+                onChange={(e) => setConnectText(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') void connectCompany(); }}
+                placeholder="rysh://connect?server=…&token=rysh_ct_…"
+                spellCheck={false}
+                className="flex-1 min-w-0 px-2 py-1.5 rounded bg-[#111] border border-[#333] font-mono text-[12px] text-[#d4d4d4] focus:outline-none focus:border-[#0e639c]"
+              />
+              <button
+                onClick={() => void connectCompany()}
+                disabled={connecting || !connectText.trim()}
+                className="px-3 py-1.5 rounded bg-[#0e639c] hover:bg-[#1177bb] text-white text-[12px] font-medium cursor-pointer disabled:opacity-50"
+              >
+                {connecting ? 'Connecting…' : 'Connect'}
+              </button>
+            </div>
+            {connectStatus && <div className="mt-2 text-[12px] text-[#aaa]">{connectStatus}</div>}
+          </div>
 
           {recent.length > 0 && (
             <div>

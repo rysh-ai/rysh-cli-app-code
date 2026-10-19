@@ -4,6 +4,7 @@ import { sendCommand } from '../utils/commands';
 import { voice } from '../utils/voice';
 import { getCompletions, completionAvailable } from '../utils/completion';
 import type { InputMode } from '../types';
+import { useIsMobileUI } from '../mobileUIContext';
 
 interface Props {
   paneId: string;
@@ -110,6 +111,13 @@ export const PaneInput = React.memo(function PaneInput({
   shellCwd,
 }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
+  // Phone UI: iOS Safari zooms the page into a focused field under 16px, and
+  // a command line must not be autocapitalized/corrected (same attributes as
+  // TouchTermInput). Desktop keeps its 13px input untouched.
+  const isMobileUI = useIsMobileUI();
+  const mobileInputProps = isMobileUI
+    ? ({ autoCapitalize: 'none', autoCorrect: 'off', autoComplete: 'off', spellCheck: false } as const)
+    : {};
   const inputText = useStore((s) => s.paneInputTexts[paneId] || '');
   const setPaneInputText = useStore((s) => s.setPaneInputText);
   const focusPane = useStore((s) => s.focusPane);
@@ -534,7 +542,10 @@ export const PaneInput = React.memo(function PaneInput({
         value={displayValue}
         placeholder={search ? '' : placeholder}
         readOnly={!!search}
-        className="flex-1 bg-transparent border-none outline-none text-[#d4d4d4] font-mono text-[13px] caret-[#00d7d7] placeholder:text-[#555]"
+        {...mobileInputProps}
+        className={`flex-1 bg-transparent border-none outline-none text-[#d4d4d4] font-mono ${
+          isMobileUI ? 'text-[16px]' : 'text-[13px]'
+        } caret-[#00d7d7] placeholder:text-[#555]`}
         onChange={(e) => {
           clearCompletion();
           setPaneInputText(paneId, e.target.value);

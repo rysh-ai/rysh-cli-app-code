@@ -26,7 +26,16 @@ export interface DaemonRecord {
   updatedAt: string
   /** Instance slot that recorded this daemon (diagnostics only; 0 = primary). */
   instanceId?: number
+  /**
+   * Who started the daemon: 'app' (this app spawned it, in this or an earlier
+   * run) or 'cli' (a command-line session the app adopted). Quit stops only
+   * 'app' daemons (founder ruling R18, E-77). Absent on older records = 'app',
+   * which is all the registry held before CLI adoption.
+   */
+  origin?: DaemonOrigin
 }
+
+export type DaemonOrigin = 'app' | 'cli'
 
 /** True if a process with this PID currently exists (and we may signal it). */
 export function isPidAlive(pid: number): boolean {

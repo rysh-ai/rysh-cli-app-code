@@ -1,8 +1,9 @@
 import React, { useLayoutEffect, useRef } from 'react';
 import { ansiToHtml } from '../utils/ansi';
+import { cellHeightOf } from '../utils/cellMetrics';
 
-// Cell metrics of .vt-screen: font-size 13px × line-height 1.2, padding 2px/4px.
-const CELL_H = 13 * 1.2;
+// .vt-screen padding 2px/4px. The cell height comes from utils/cellMetrics,
+// shared with usePaneResize so the follow offset matches the PTY grid.
 const PAD_Y = 4; // 2px top + 2px bottom
 
 interface Props {
@@ -46,6 +47,7 @@ export const VTScreen = React.memo(function VTScreen({ lines, cursorRow, echo }:
     const outer = inner?.parentElement;
     if (!inner || !outer) return;
     const apply = () => {
+      const CELL_H = cellHeightOf(outer);
       const viewH = outer.clientHeight - PAD_Y;
       const contentH = lines.length * CELL_H;
       let offset = 0;

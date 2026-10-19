@@ -1,0 +1,22 @@
+# AppArmor profile for the rysh desktop app (E-92), installed to
+# /etc/apparmor.d/rysh-desktop by the .deb postinst.
+#
+# It confines nothing (flags=(unconfined)). Its one job is the `userns` rule:
+# Ubuntu 23.10+ sets kernel.apparmor_restrict_unprivileged_userns=1, which
+# denies unprivileged user namespaces to any binary without a profile granting
+# them, and Chromium's namespace sandbox needs one. Same shape as the profiles
+# Chrome and VS Code ship. Requires AppArmor abi/4.0; the postinst dry-runs it
+# and skips installation where that is missing (Ubuntu 22.04).
+#
+# It attaches to rysh-desktop.bin, the real Electron binary: since E-94,
+# /opt/Rysh/rysh-desktop is a sh launcher that execs it, and the namespace is
+# created by the binary, not the launcher.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile rysh-desktop /opt/Rysh/rysh-desktop.bin flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/rysh-desktop>
+}

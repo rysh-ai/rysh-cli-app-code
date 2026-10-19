@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { act, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { AgentsBoardView } from './AgentsBoardView';
 import { useStore } from '../store';
 import type { BoardData } from '../types';
@@ -185,4 +185,77 @@ describe('AgentsBoardView — a daemon that never answers', () => {
       vi.useRealTimers();
     }
   });
+});
+
+// Design 049: the TUI board pane's y / Y / o. The text must be what
+// `##board copy` produces (board/items.ts is the port), and an empty board is
+// a refusal in the status line, never an empty clipboard.
+describe('AgentsBoardView — copy and output (design 049)', () => {
+  const threads = [
+    {
+      key: 'pane-a/1',
+      root: { pane_id: 'pane-a-0000', persona: 'one-tetra', kind: 'milestone', text: 'first', ts: 1 },
+      replies: [
+        {
+          pane_id: 'pane-b-0000',
+          persona: 'key-hornet',
+          kind: 'cmd',
+          text: 'do the thing',
+          ts: 2,
+          to_persona: 'one-tetra',
+          to_pane_id: 'pane-a-0000',
+          cmd_id: 'cmd-abc-12',
+          file: '/tmp/order.md',
+        },
+      ],
+      provisional: false,
+    },
+  ];
+
+  it('y copies the newest message as ##board copy text', async () => {
+    const writes: string[] = [];
+    Object.assign(navigator, { clipboard: { writeText: async (t: string) => void writes.push(t) } });
+    render(<AgentsBoardView paneId="p1" boardId="desktop" />);
+    seed({ paneId: 'p1', threads });
+    await act(async () => {
+      fireEvent.keyDown(screen.getByText('first').closest('[tabindex]')!, { key: 'y' });
+    });
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatch(/^● key-hornet {2}\[cmd\] {2}\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\ndo the thing$/);
+    expect(screen.getByText('[board] copied 1 of 2 messages to the clipboard')).toBeTruthy();
+  });
+
+  it('refuses to copy an empty board', async () => {
+    render(<AgentsBoardView paneId="p1" boardId="desktop" />);
+    seed({ paneId: 'p1', threads: [] });
+    await act(async () => {
+      fireEvent.click(screen.getByText('copy newest'));
+    });
+    expect(screen.getByText('[board] no messages')).toBeTruthy();
+  });
+
+  it('shows a command addressee, id and file (design 050)', () => {
+    render(<AgentsBoardView paneId="p1" boardId="desktop" />);
+    seed({ paneId: 'p1', threads });
+    expect(screen.getByText('→ one-tetra')).toBeTruthy();
+    expect(screen.getByText('#cmd-abc-12')).toBeTruthy();
+    expect(screen.getByText('/tmp/order.md')).toBeTruthy();
+  });
+});
+
+it('strips terminal escapes from agent-written posts, as the terminal board does', () => {
+  render(<AgentsBoardView paneId="p1" boardId="desktop" />);
+  seed({
+    paneId: 'p1',
+    threads: [
+      {
+        key: 'k',
+        root: { pane_id: 'a', persona: 'w\x1b[1m1', kind: 'milestone', text: '\x1b[32mgreen\x1b[0m text', ts: 1 },
+        replies: [],
+        provisional: false,
+      },
+    ],
+  });
+  expect(screen.getByText('green text')).toBeTruthy();
+  expect(screen.getByText('w1')).toBeTruthy();
 });

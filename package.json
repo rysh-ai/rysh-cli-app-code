@@ -1,8 +1,9 @@
 {
   "name": "rysh-cli-app",
-  "version": "0.2.0",
+  "version": "0.2.11",
   "private": true,
   "description": "Rysh Desktop — Agentic terminal multiplexer with embedded web panes",
+  "homepage": "https://rysh.ai",
   "main": "dist/electron/main.js",
   "type": "module",
   "scripts": {
@@ -11,7 +12,7 @@
     "preview": "electron-vite preview",
     "package": "electron-builder",
     "make:mac": "electron-builder --mac",
-    "make:linux": "electron-builder --linux",
+    "make:linux": "./scripts/preflight-linux-deb.sh && electron-builder --linux",
     "icons": "./scripts/gen-icons.sh",
     "test": "vitest",
     "test:run": "vitest run",
@@ -20,8 +21,11 @@
     "typecheck": "npm run typecheck:main && npm run typecheck:renderer"
   },
   "dependencies": {
+    "@livekit/components-react": "^2.9.24",
+    "@livekit/components-styles": "^1.2.0",
     "electron-store": "^10.0.0",
     "electron-updater": "^6.3.9",
+    "livekit-client": "^2.22.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "zustand": "^4.5.5"
@@ -39,6 +43,7 @@
     "electron": "^41.10.1",
     "electron-builder": "^25.1.8",
     "electron-vite": "^2.3.0",
+    "js-yaml": "^4.1.1",
     "jsdom": "^30.0.1",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",

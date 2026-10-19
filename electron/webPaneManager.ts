@@ -1,4 +1,9 @@
-import { BrowserWindow, WebContentsView, session } from 'electron'
+import { BrowserWindow, WebContentsView, desktopCapturer, dialog, session, webContents } from 'electron'
+import { installMeetingPermissions } from './meetingPermissions'
+import { webPanePermission } from './webPanePermissions'
+import { meetingBrowserUrl, meetingNavigationTarget } from './meetingJoinUrl'
+import { IDENTITY_BUDGET_MS, loadWithIdentity, settleWithin } from './webPaneBootstrap'
+import { loadErrorFor, shouldAutoRetry, type WebPaneLoadError } from './webPaneLoadError'
 
 // Web panes render desktop pages at a fixed reference layout width, then scale
 // the whole page (Chromium page-zoom) so that full-width layout fits the pane.
@@ -32,6 +37,8 @@ export interface WebPaneStatus {
   canGoBack: boolean
   canGoForward: boolean
   loading: boolean
+  /** The main frame's last load failure; cleared when a navigation commits. */
+  loadError?: WebPaneLoadError
 }
 
 /**
@@ -59,6 +66,15 @@ interface WebPaneEntry {
   // recreated against the new persistent partition instead of silently
   // reattaching the old one.
   profile: string
+  // A meeting pane (design 043): same view and partition as a web pane, plus
+  // camera/mic/screen share for allowlisted meeting origins. See
+  // meetingPermissions.ts.
+  meeting: boolean
+}
+
+/** Options for create(); absent = a plain web pane. */
+export interface WebPaneCreateOptions {
+  meeting?: boolean
 }
 
 /**
@@ -89,6 +105,11 @@ export class WebPaneManager {
   // render above it. show()/create() honour this so a pane activated mid-modal
   // stays hidden until setSuppressed(false). See setSuppressed.
   private suppressed = false
+  // Partitions that already carry the permission handlers (meetingPermissions.ts
+  // + webPanePermissions.ts). Installed on every web-pane partition — web or
+  // meeting — because one partition can host both and Electron keeps a single
+  // handler per session.
+  private permissionPatchedSessions = new WeakSet<Electron.Session>()
 
   constructor(window: BrowserWindow) {
     this.window = window
@@ -320,7 +341,8 @@ export class WebPaneManager {
   /**
    * Create a new web pane with an isolated session.
    */
-  create(paneId: string, url: string, profile: string, bounds?: WebPaneBounds): void {
+  create(paneId: string, url: string, profile: string, bounds?: WebPaneBounds, opts?: WebPaneCreateOptions): void {
+    const meeting = opts?.meeting === true
     // Persistent, named session partition keyed by the rysh-cli profile name so
     // panes (and restarts) bound to the same profile share cookies/login state.
     // The partition lives under Electron's default (stable) userData/Partitions
@@ -339,7 +361,7 @@ export class WebPaneManager {
 
     const existing = this.panes.get(paneId)
     if (existing) {
-      if (existing.profile === partitionName) {
+      if (existing.profile === partitionName && existing.meeting === meeting) {
         // Same profile: this is a remount (fullscreen toggle, stack rotation, or
         // cycling away from web mode and back). Re-show the SAME live view
         // (preserving the page, navigation history and session) instead of
@@ -370,6 +392,12 @@ export class WebPaneManager {
     // disallowed user agent. Done before the first load; covers OAuth popups too
     // (they share this session).
     this.spoofChromeIdentity(ses)
+    this.installPermissions(ses)
+    if (meeting) {
+      // Zoom and Teams links land on a "launch the app" page in a browser; a
+      // meeting pane opens the platform's browser join (meetingJoinUrl.ts).
+      url = meetingBrowserUrl(url)
+    }
 
     const view = new WebContentsView({
       webPreferences: {
@@ -403,24 +431,84 @@ export class WebPaneManager {
     if (this.suppressed) view.setVisible(false)
 
     // Store the entry
-    const entry: WebPaneEntry = { view, bounds: defaultBounds, paneId, profile: partitionName }
+    const entry: WebPaneEntry = { view, bounds: defaultBounds, paneId, profile: partitionName, meeting }
     this.panes.set(paneId, entry)
 
     // Register navigation event handlers
     this.registerEventHandlers(paneId, view)
 
     // Apply the deep identity override (UA + navigator.userAgentData via CDP)
-    // BEFORE the first navigation, THEN load — so the initial document already
+    // BEFORE the first real document, THEN load — so that document already
     // sees a plain-Chrome identity and Google's sign-in gate doesn't fire. The
     // header/session spoof above covers requests; this covers the client-side JS
-    // check. If the override can't attach, we still load (headers are patched).
-    this.applyIdentityOverride(view.webContents).finally(() => {
-      view.webContents.loadURL(url).catch((err) => {
-        console.error(`[webPane:${paneId}] Failed to load URL ${url}:`, err)
-      })
-    })
+    // check. loadWithIdentity primes the view with about:blank first (CDP never
+    // answers on a view that has not navigated — Electron 41) and bounds the
+    // whole step, so the page loads even if the debugger does not.
+    loadWithIdentity(view.webContents, url, (c) => this.applyIdentityOverride(c as Electron.WebContents)).then(
+      ({ identity, load }) => {
+        if (identity === 'timeout') {
+          console.error(`[webPane:${paneId}] identity override timed out; loading with the header spoof only`)
+        }
+        load.catch((err) => {
+          console.error(`[webPane:${paneId}] Failed to load URL ${url}:`, err)
+        })
+      },
+      (err) => console.error(`[webPane:${paneId}] Failed to start loading ${url}:`, err),
+    )
 
     console.log(`[webPane] Created pane ${paneId} → ${url}`)
+  }
+
+  /**
+   * True when `wc` is a meeting pane's own view. Popups it opens (OAuth) are
+   * separate webContents and are not meeting panes.
+   */
+  isMeetingContents(wc: Electron.WebContents | null | undefined): boolean {
+    if (!wc) return false
+    for (const entry of this.panes.values()) {
+      if (entry.meeting && entry.view.webContents === wc) return true
+    }
+    return false
+  }
+
+  /**
+   * Permission handlers for a web-pane partition (E-76 + design 043 D8): meeting
+   * panes get camera/mic/screen on allowlisted platforms, everything else is the
+   * deny-by-default web-pane policy. Once per session.
+   */
+  private installPermissions(ses: Electron.Session): void {
+    if (this.permissionPatchedSessions.has(ses)) return
+    this.permissionPatchedSessions.add(ses)
+    installMeetingPermissions(ses, {
+      isMeetingPane: (wc) => this.isMeetingContents(wc),
+      contentsOfFrame: (frame) => (frame ? webContents.fromFrame(frame) : undefined),
+      pickSource: () => this.pickShareSource(),
+      whenUndecided: webPanePermission,
+    })
+  }
+
+  /**
+   * Minimal screen/window picker for a meeting pane's screen share: one button
+   * per source (screens first). Returns null when cancelled.
+   */
+  private async pickShareSource(): Promise<Electron.DesktopCapturerSource | null> {
+    const sources = await desktopCapturer.getSources({ types: ['screen', 'window'] })
+    const shown = sources.slice(0, 8)
+    if (shown.length === 0) return null
+    const buttons = [...shown.map((s) => s.name || s.id), 'Cancel']
+    const opts: Electron.MessageBoxOptions = {
+      type: 'question',
+      message: 'Share your screen in the meeting',
+      detail: 'Choose what the meeting will see.',
+      buttons,
+      cancelId: buttons.length - 1,
+      defaultId: buttons.length - 1,
+    }
+    const { response } =
+      this.window && !this.window.isDestroyed()
+        ? await dialog.showMessageBox(this.window, opts)
+        : await dialog.showMessageBox(opts)
+    return response < shown.length ? shown[response] : null
   }
 
   /**
@@ -856,6 +944,9 @@ export class WebPaneManager {
     // Ensure the plain-Chrome identity spoof is registered on this session even
     // if no pane has been created on it yet (idempotent).
     this.spoofChromeIdentity(ses)
+    // Same for the permission handlers: a partition first touched here must not
+    // sit with Electron's grant-everything default until a pane opens on it.
+    this.installPermissions(ses)
 
     let set = 0
     let failed = 0
@@ -923,6 +1014,10 @@ export class WebPaneManager {
    */
   private registerEventHandlers(paneId: string, view: WebContentsView): void {
     const contents = view.webContents
+    // The main frame's last failure, and the URL already retried once since the
+    // last committed navigation (webPaneLoadError.ts).
+    let loadError: WebPaneLoadError | undefined
+    let retriedUrl: string | undefined
 
     const emitStatus = (): void => {
       if (!this.statusCallback) return
@@ -934,6 +1029,7 @@ export class WebPaneManager {
         canGoBack: contents.navigationHistory.canGoBack(),
         canGoForward: contents.navigationHistory.canGoForward(),
         loading: contents.isLoading(),
+        loadError,
       })
     }
 
@@ -942,15 +1038,47 @@ export class WebPaneManager {
     // would otherwise render at 1.0 and clip in a small pane.
     const applyZoom = (): void => this.applyFitZoom(this.panes.get(paneId))
 
-    contents.on('did-navigate', () => { emitStatus(); applyZoom() })
+    contents.on('did-navigate', () => {
+      loadError = undefined
+      retriedUrl = undefined
+      emitStatus()
+      applyZoom()
+    })
     contents.on('did-navigate-in-page', emitStatus)
+
+    // A meeting pane stays in the browser: a navigation or redirect to a Zoom
+    // or Teams landing page (the app hand-off) goes to the browser join
+    // instead (design 043 §"Zoom and Teams in panes").
+    const rewritten = new Set<string>()
+    const toBrowserJoin = (details: Electron.Event<{ url: string; isMainFrame: boolean }>): void => {
+      if (!details.isMainFrame || !this.panes.get(paneId)?.meeting) return
+      const target = meetingNavigationTarget(details.url, rewritten)
+      if (!target) return
+      details.preventDefault()
+      console.log(`[webPane:${paneId}] meeting pane: ${details.url} → browser join ${target}`)
+      contents.loadURL(target).catch(() => { /* reported by did-fail-load */ })
+    }
+    contents.on('will-navigate', toBrowserJoin)
+    contents.on('will-redirect', toBrowserJoin)
     contents.on('did-finish-load', applyZoom)
     contents.on('dom-ready', applyZoom)
     contents.on('page-title-updated', emitStatus)
     contents.on('did-start-loading', emitStatus)
     contents.on('did-stop-loading', emitStatus)
-    contents.on('did-fail-load', (_event, errorCode, errorDescription) => {
+    contents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
       console.error(`[webPane:${paneId}] Load failed: ${errorCode} ${errorDescription}`)
+      const failure = loadErrorFor(errorCode, errorDescription, validatedURL, isMainFrame)
+      if (failure && shouldAutoRetry(failure, retriedUrl)) {
+        // One quiet second attempt: the sign-in TLS close seen on
+        // accounts.google.com did not recur on the next load.
+        retriedUrl = failure.url
+        console.error(`[webPane:${paneId}] retrying once after ${failure.description}`)
+        setTimeout(() => {
+          if (!contents.isDestroyed()) contents.loadURL(failure.url).catch(() => { /* reported by did-fail-load */ })
+        }, 1000)
+        return
+      }
+      if (failure) loadError = failure
       emitStatus()
     })
 
@@ -987,7 +1115,7 @@ export class WebPaneManager {
           },
         }
       }
-      contents.loadURL(url).catch(() => {})
+      contents.loadURL(this.panes.get(paneId)?.meeting ? meetingBrowserUrl(url) : url).catch(() => {})
       return { action: 'deny' }
     })
 
@@ -998,7 +1126,11 @@ export class WebPaneManager {
       // The popup is a separate webContents (shares the session, so its headers
       // are already spoofed) — give it the same CDP identity override so its
       // navigator.userAgentData isn't "Electron" during the sign-in handshake.
-      this.applyIdentityOverride(child.webContents).catch(() => {})
+      // Not primed with about:blank: the popup is already on its way to the
+      // provider page, and navigating it would break the sign-in. The override
+      // applies from the popup's next document, and nothing waits on a debugger
+      // that never answers.
+      void settleWithin(this.applyIdentityOverride(child.webContents), IDENTITY_BUDGET_MS)
       this.presentChildWindow(child)
       child.webContents.setWindowOpenHandler((d) => {
         if (d.disposition === 'new-window' || d.disposition === 'other') {

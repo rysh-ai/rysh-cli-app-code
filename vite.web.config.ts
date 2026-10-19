@@ -18,6 +18,14 @@ import react from '@vitejs/plugin-react'
 //
 //   npx vite build --config vite.web.config.ts
 //   # or: make -f Makefile.internal_web web   (from the repo root)
+// F-48: this config only ever builds the bundle rysh-cli embeds, so it is always
+// a production build. Pinned here, not by callers: Vite reads NODE_ENV from the
+// caller's shell, and with NODE_ENV=development ambient it emitted the React dev
+// runtime (jsxDEV) and the builder's absolute source paths into a shipped
+// artifact. Vite computes isProduction after loading this file, so the pin wins.
+// The Electron renderer (electron.vite.config.ts) and vitest do not read this file.
+process.env.NODE_ENV = 'production'
+
 export default defineConfig({
   root: __dirname,
   base: '/',

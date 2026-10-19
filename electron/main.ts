@@ -1,7 +1,10 @@
 import { app, BrowserWindow, dialog, shell, session } from 'electron'
 import { join, basename } from 'path'
 import { is } from '@electron-toolkit/utils'
-import { SidecarManager } from './sidecar'
+import { SidecarManager, resolveSidecarBinaryPath } from './sidecar'
+import { registerFaceTimeHandlers } from './facetime'
+import { registerMeetingReportHandler } from './meetingReport'
+import { pathToFileURL } from 'node:url'
 import { WebPaneManager } from './webPaneManager'
 import { registerIpcHandlers } from './ipc'
 import { NativeMenuManager } from './menuManager'
@@ -16,6 +19,8 @@ import {
   spawnNewInstance,
   focusSiblingInstance,
 } from './instanceManager'
+import { connectLinksInArgv, parseConnectLink, runConnect } from './companyConnect'
+import { defaultWorkspacePath, ensureDefaultWorkspace, planBoot } from './defaultWorkspace'
 
 let mainWindow: BrowserWindow | null = null
 
@@ -55,6 +60,64 @@ let workspaceManager: WorkspaceManager | null = null
 // stop→start cycles on the same session (which would race two daemons on one
 // NATS server — the exact failure killStaleSidecars exists to prevent).
 let restartingDaemon = false
+
+// Company Connect (design 037). Links can arrive before the window exists —
+// macOS fires open-url for a cold launch, Linux passes the URL in argv — so
+// they queue here and drain once the app is ready to open a workspace.
+const pendingConnectLinks: string[] = connectLinksInArgv(process.argv)
+let appReadyForConnect = false
+app.on('open-url', (event, url) => {
+  event.preventDefault()
+  pendingConnectLinks.push(url)
+  if (appReadyForConnect) void drainConnectLinks()
+})
+
+function sendConnectStatus(stage: 'claiming' | 'opening' | 'done' | 'error', message: string): void {
+  mainWindow?.webContents.send('company-connect-status', { stage, message })
+}
+
+/**
+ * handleConnectLink claims a code through the sidecar and opens the company
+ * workspace it wrote. Accepts the deep link or any of the pasted forms
+ * parseConnectLink understands. Never throws: the outcome goes to the renderer
+ * as a status, and back to the IPC caller as {success, error}.
+ */
+async function handleConnectLink(link: string): Promise<{ success: boolean; error?: string }> {
+  const target = parseConnectLink(link)
+  if (!target) {
+    const error = 'That is not a connect code. Paste the rysh:// link or the `ry connect …` line from the company page.'
+    sendConnectStatus('error', error)
+    return { success: false, error }
+  }
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    mainWindow.focus()
+  }
+  sendConnectStatus('claiming', `Connecting to ${target.server}…`)
+  try {
+    const result = await runConnect(resolveSidecarBinaryPath(), target)
+    sendConnectStatus('opening', `Opening ${result.company.name}…`)
+    const opened = await openWorkspace(result.directory, result.session)
+    if (!opened.success) {
+      sendConnectStatus('error', opened.error || 'Could not open the company workspace')
+      return opened
+    }
+    sendConnectStatus('done', `${result.company.name} is open`)
+    return { success: true }
+  } catch (err) {
+    const error = (err as Error).message || String(err)
+    console.error('[main] company connect failed:', error)
+    sendConnectStatus('error', error)
+    return { success: false, error }
+  }
+}
+
+async function drainConnectLinks(): Promise<void> {
+  while (pendingConnectLinks.length > 0) {
+    const link = pendingConnectLinks.shift()
+    if (link) await handleConnectLink(link)
+  }
+}
 
 function createWindow(): BrowserWindow {
   // Restore previous window bounds if available
@@ -150,6 +213,11 @@ function createWindow(): BrowserWindow {
     win.loadFile(join(__dirname, '../renderer/index.html'))
   }
 
+  const rendererURL = is.dev && process.env['ELECTRON_RENDERER_URL']
+    ? process.env['ELECTRON_RENDERER_URL']
+    : pathToFileURL(join(__dirname, '../renderer/index.html')).href
+  registerFaceTimeHandlers(win, rendererURL, resolveSidecarBinaryPath)
+  registerMeetingReportHandler(win, rendererURL)
   return win
 }
 
@@ -183,13 +251,13 @@ async function adoptOrStart(
   dirPath: string
 ): Promise<boolean> {
   const known = sidecar.getRegistry().findAlive(dirPath, sessionName)
-  if (known && (await sidecar.adopt(sessionName, dirPath, known.webPort, known.pid))) {
+  if (known && (await sidecar.adopt(sessionName, dirPath, known.webPort, known.pid, known.origin ?? 'app'))) {
     return true
   }
 
   const found = await sidecar.ensureWebEndpoint(sessionName, dirPath)
   if (found.kind === 'endpoint') {
-    if (await sidecar.adopt(sessionName, dirPath, found.port, found.pid)) {
+    if (await sidecar.adopt(sessionName, dirPath, found.port, found.pid, found.origin)) {
       return true
     }
     throw new Error(
@@ -255,10 +323,10 @@ async function openWorkspace(
   }
 
   try {
-    // Stop the current (app-owned) sidecar — we're navigating away from it. A
-    // deliberately-detached daemon would have been left via detachSession(),
-    // not via this path, so stopping here is correct.
-    await sidecarManager.stop()
+    // Let go of the current daemon — we're navigating away from it. One the app
+    // spawned is stopped; an adopted command-line daemon keeps running (R18).
+    // A deliberately-detached daemon was left via detachSession(), not here.
+    await sidecarManager.shutdown()
 
     // Destroy all web panes
     webPaneManager.destroyAll()
@@ -360,8 +428,9 @@ async function closeWorkspace(): Promise<{ success: boolean; error?: string }> {
   console.log('[main] Closing workspace; returning to the empty screen (no daemon)')
 
   try {
-    // Stop the running daemon and drop its web panes (mirrors openWorkspace).
-    await sidecarManager.stop()
+    // Let go of the daemon (stop it if the app spawned it; R18) and drop its
+    // web panes (mirrors openWorkspace).
+    await sidecarManager.shutdown()
     webPaneManager.destroyAll()
 
     // Reset the sidecar's target so a later open starts from a clean slate.
@@ -510,7 +579,8 @@ async function restartDaemon(): Promise<{ success: boolean; error?: string }> {
  * state. The daemon's {pid, webPort} stays in the registry, so it can be
  * re-adopted later by opening the same workspace + session in the picker.
  *
- * Distinct from Quit (Cmd+Q), which stops the daemon, and from Close Workspace,
+ * Distinct from Quit (Cmd+Q), which stops a daemon the app spawned (an adopted
+ * command-line daemon is released the same way as here, R18), and from Close Workspace,
  * which reverts to a fresh default session. Backs the File ▸ "Detach Session"
  * menu item and the Header ⏏ button.
  */
@@ -592,14 +662,25 @@ app.whenReady().then(async () => {
     allowMediaForMain(wc ?? undefined, permission)
   )
 
-  // Boot policy: a fresh instance starts with NO daemon and an empty (welcome)
-  // screen — nothing runs until the user opens a workspace. If THIS instance's
-  // profile previously had a workspace open (and it wasn't explicitly closed),
-  // reopen it now — same workspace, same session — adopting a daemon a Detach
-  // left running when one is alive. The renderer pulls the resulting state
-  // (workspace.getCurrent + getPort) when it loads, so no notify is needed here.
+  // Boot policy: if THIS instance's profile previously had a workspace open
+  // (and it wasn't explicitly closed), reopen it now — same workspace, same
+  // session — adopting a daemon a Detach left running when one is alive.
+  // Otherwise the instance starts with NO daemon on the welcome screen, with ONE
+  // exception (E-90, founder ruling R8): a true first run — no last workspace and
+  // no recents, primary instance, no connect link pending — creates and opens
+  // the default workspace (~/rysh-workspace, or $RYSH_DEFAULT_WORKSPACE) so a
+  // pane works with no CLI and no dialog. planBoot() holds the decision. The
+  // renderer pulls the resulting state (workspace.getCurrent + getPort) when it
+  // loads, so no notify is needed here.
   const lastWs = workspaceManager.getLast()
-  if (lastWs && workspaceManager.validateWorkspace(lastWs.path)) {
+  const bootPlan = planBoot({
+    hasLast: lastWs != null,
+    lastValid: lastWs != null && workspaceManager.validateWorkspace(lastWs.path),
+    recentCount: workspaceManager.getRecent().length,
+    isPrimary: instance.isPrimary,
+    pendingConnectLinks: pendingConnectLinks.length,
+  })
+  if (lastWs && bootPlan.kind === 'reopen-last') {
     try {
       // Session preference: the one recorded with the workspace; else the
       // workspace's most-recently-used app session (legacy entries predate the
@@ -624,8 +705,31 @@ app.whenReady().then(async () => {
       console.error('[main] Failed to reopen the last workspace:', err)
       // Fall through to the empty screen; the user can open it manually.
     }
+  } else if (bootPlan.kind === 'auto-create-default') {
+    const target = defaultWorkspacePath(process.env, app.getPath('home'))
+    const ws = ensureDefaultWorkspace(target, (dir) => workspaceManager!.validateWorkspace(dir))
+    if (ws.kind === 'unusable') {
+      console.warn(
+        `[main] First run: not using default workspace ${ws.path}: ${ws.reason} — starting on the empty screen (no daemon)`
+      )
+    } else {
+      // The folder name, exactly as an ordinary first open of a folder would.
+      const session = basename(ws.path)
+      try {
+        const adopted = await adoptOrStart(sidecarManager, session, ws.path)
+        workspaceManager.setCurrent(ws.path)
+        workspaceManager.addRecent(ws.path, session)
+        console.log(
+          `[main] First run: ${ws.kind === 'created' ? 'created' : 'opened existing'} default workspace ` +
+            `${ws.path} (session "${session}") — ${adopted ? 'adopted daemon' : 'cold-started'} on port ${sidecarManager.getPort()}`
+        )
+      } catch (err) {
+        console.error(`[main] First run: failed to open default workspace ${ws.path} — starting on the empty screen:`, err)
+      }
+    }
   } else {
-    console.log('[main] No previous workspace — starting on the empty screen (no daemon)')
+    const why = bootPlan.kind === 'welcome' ? ` (${bootPlan.reason})` : ''
+    console.log(`[main] No previous workspace — starting on the empty screen (no daemon)${why}`)
   }
 
   // Create the main window
@@ -637,6 +741,7 @@ app.whenReady().then(async () => {
   // Register IPC handlers (including workspace handlers)
   registerIpcHandlers(sidecarManager, webPaneManager, workspaceManager, {
     onOpenWorkspace: () => showOpenWorkspaceDialog(),
+    onConnectCompany: (link: string) => handleConnectLink(link),
     onSelectWorkspace: async (path: string) => {
       // An empty path is the "Close Workspace" signal.
       if (!path) return closeWorkspace()
@@ -672,6 +777,20 @@ app.whenReady().then(async () => {
   })
   menuManager.setup()
 
+  // Company Connect (design 037): claim the rysh:// scheme so the dashboard's
+  // "Connect the desktop app" button reaches this app, then serve any link
+  // that arrived before the window existed. In development the registration
+  // must name the electron binary and the app path, or the OS would launch a
+  // bare electron.
+  try {
+    if (app.isPackaged) app.setAsDefaultProtocolClient('rysh')
+    else app.setAsDefaultProtocolClient('rysh', process.execPath, [app.getAppPath()])
+  } catch (err) {
+    console.warn('[main] could not register the rysh:// scheme:', err)
+  }
+  appReadyForConnect = true
+  void drainConnectLinks()
+
   // Set up auto-updater (production only)
   if (!is.dev) {
     autoUpdateManager = new AutoUpdateManager(mainWindow)
@@ -697,13 +816,15 @@ app.on('before-quit', async () => {
   // reattach). Safe to drop on both Detach and Quit.
   webPaneManager?.destroyAll()
 
-  // Normal Quit — stop the daemon (and drop its registry record via stop()).
-  // A previously-detached daemon was already let go of (sidecarManager.detach()
-  // cleared our handle), so stop() is a no-op for it and it keeps running.
+  // Normal Quit (also the path of an update's quitAndInstall and of a
+  // relaunch) — stop a daemon the app spawned, dropping its registry record.
+  // An adopted command-line daemon is released like a Detach and keeps
+  // running (founder ruling R18, E-77). A previously-detached daemon was
+  // already let go of (detach() cleared our handle), so this is a no-op for it.
   if (sidecarManager) {
     try {
-      await sidecarManager.stop()
-      console.log('[main] Sidecar stopped')
+      await sidecarManager.shutdown()
+      console.log('[main] Sidecar shut down')
     } catch (err) {
       console.error('[main] Error stopping sidecar:', err)
     }

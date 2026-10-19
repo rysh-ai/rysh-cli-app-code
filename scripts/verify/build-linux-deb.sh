@@ -69,7 +69,8 @@ docker run --rm \
     mkdir -p /build && cd /build
     cp -a /src/package.json /src/electron-builder.yml /build/
     cp -a /src/dist /src/sidecar /src/resources /build/
-    git init -q . && git remote add origin https://github.com/rysh-ai/rysh-cli-app.git
+    # The public repo, so the public tree never names the private one (root-0406).
+    git init -q . && git remote add origin https://github.com/rysh-ai/rysh-cli-app-code.git
     electron-builder --linux deb --x64 --publish never \
       -c.electronVersion="$ELECTRON_VERSION"
     cp -v /build/release/*.deb /out/

@@ -1,9 +1,10 @@
 import { spawn, execFileSync, ChildProcess } from 'child_process'
+import { readFileSync } from 'fs'
 import { join } from 'path'
 import { app } from 'electron'
 import { is } from '@electron-toolkit/utils'
 import * as http from 'http'
-import { DaemonRegistry, isPidAlive } from './daemonRegistry'
+import { DaemonRegistry, isPidAlive, type DaemonOrigin } from './daemonRegistry'
 import { findSession } from './sessionStore'
 
 /**
@@ -24,7 +25,7 @@ const DEFAULT_NATS_PORT = 24242
  *   ws.* subjects as the first.
  */
 export type EndpointLookup =
-  | { kind: 'endpoint'; port: number; pid: number }
+  | { kind: 'endpoint'; port: number; pid: number; origin: DaemonOrigin }
   | { kind: 'none' }
   | { kind: 'unreachable'; pid: number; reason: string }
 
@@ -47,6 +48,9 @@ export class SidecarManager {
   // no ChildProcess handle — only its PID. Tracked here so stop()/isRunning()
   // work against the adopted daemon as well as ones we spawned.
   private adoptedPid: number | null = null
+  // Who started the adopted daemon (R18, E-77): 'cli' ones are released on
+  // Quit, never stopped; 'app' ones are the app's own and stop as before.
+  private adoptedOrigin: DaemonOrigin = 'app'
   // Per-instance embedded-NATS port (RYSH_NATS_PORT). null = use the daemon's
   // built-in 24242 default, which is what the primary instance does.
   private natsPort: number | null = null
@@ -127,8 +131,10 @@ export class SidecarManager {
     }
 
     // A door already advertised and answering: use it as-is.
+    // The session record says which front-end started the daemon.
+    const origin: DaemonOrigin = rec.source === 'app' ? 'app' : 'cli'
     if (rec.webPort > 0 && (await this.probeHealth(rec.webPort))) {
-      return { kind: 'endpoint', port: rec.webPort, pid: rec.pid }
+      return { kind: 'endpoint', port: rec.webPort, pid: rec.pid, origin }
     }
 
     // Live daemon, no reachable web server — ask it to open one.
@@ -169,6 +175,7 @@ export class SidecarManager {
           kind: 'endpoint',
           port: fresh.webPort,
           pid: fresh.pid || rec.pid,
+          origin,
         }
       }
     }
@@ -189,7 +196,7 @@ export class SidecarManager {
    * port. Returns true on success; on failure the caller should fall back to
    * start() (cold restore from KV).
    */
-  async adopt(sessionName: string, cwd: string, webPort: number, pid: number): Promise<boolean> {
+  async adopt(sessionName: string, cwd: string, webPort: number, pid: number, origin: DaemonOrigin = 'app'): Promise<boolean> {
     if (!isPidAlive(pid)) {
       this.registry.remove(cwd, sessionName)
       return false
@@ -207,6 +214,7 @@ export class SidecarManager {
     // PID. No exit-handler / auto-restart for an adopted daemon.
     this.process = null
     this.adoptedPid = pid
+    this.adoptedOrigin = origin
     this.stopping = false
     this.restartCount = 0
     this.registry.record({
@@ -215,8 +223,9 @@ export class SidecarManager {
       pid,
       webPort,
       updatedAt: new Date().toISOString(),
+      origin,
     })
-    console.log(`[sidecar] Adopted running daemon pid=${pid} session=${sessionName} (web port: ${webPort})`)
+    console.log(`[sidecar] Adopted running ${origin} daemon pid=${pid} session=${sessionName} (web port: ${webPort})`)
     return true
   }
 
@@ -247,6 +256,7 @@ export class SidecarManager {
   async start(): Promise<void> {
     this.stopping = false
     this.adoptedPid = null
+    this.adoptedOrigin = 'app'
     // Reap any sidecar left over from a previous run BEFORE starting a new one.
     // A force-quit or crash skips before-quit (so stop() never ran) and leaves
     // the detached daemon alive. Two daemons for the same session on a shared
@@ -338,6 +348,15 @@ export class SidecarManager {
 
     this.process.on('exit', (code, signal) => {
       console.log(`[sidecar] Exited with code=${code} signal=${signal}`)
+      // A non-zero exit here used to be the end of the trail. The daemon goes
+      // headless shortly after start (goHeadless() dup2's /dev/null over fd 2),
+      // so the pipes above only ever caught startup output, and a Go panic —
+      // which is what exit status 2 IS — printed its report into /dev/null and
+      // left `code=2 signal=null` as the only evidence anywhere. The daemon now
+      // mirrors runtime crash reports to a file that survives that redirect
+      // (rysh-cli cmd/rysh/crashlog.go); print the tail of it right here so the
+      // cause sits next to the exit instead of in a file nobody knows about.
+      if (code !== 0 && code !== null) this.reportCrash()
       this.process = null
 
       if (!this.stopping && this.restartCount < this.maxRestarts) {
@@ -378,8 +397,27 @@ export class SidecarManager {
   }
 
   /**
+   * Let go of the daemon when the app is done with it — Quit, switching or
+   * closing the workspace. A daemon this app spawned (now, or in an earlier run
+   * and re-adopted) is stopped, as stop() does. An adopted command-line daemon
+   * is not the app's to stop (founder ruling R18, E-77): it is released exactly
+   * as Detach releases one — left running, its registry record kept (origin
+   * 'cli'), so the next launch re-adopts it and still releases it.
+   */
+  async shutdown(): Promise<void> {
+    if (!this.process && this.adoptedPid && this.adoptedOrigin === 'cli') {
+      const pid = this.detach()
+      console.log(`[sidecar] Released command-line daemon pid=${pid} (not stopped: the app did not start it)`)
+      return
+    }
+    return this.stop()
+  }
+
+  /**
    * Stop the sidecar gracefully and forget it (drops its registry record — this
-   * is an intentional kill, not a detach). Handles both daemons we spawned
+   * is an intentional kill, not a detach). Quit and workspace switches use
+   * shutdown(), which never stops a command-line daemon; stop() itself is for
+   * an explicit user action (Restart Daemon). Handles both daemons we spawned
    * (ChildProcess handle) and ones we adopted (PID only).
    */
   async stop(): Promise<void> {
@@ -509,6 +547,33 @@ export class SidecarManager {
     if (this.process !== null && !this.process.killed) return true
     if (this.adoptedPid && isPidAlive(this.adoptedPid)) return true
     return false
+  }
+
+  /**
+   * Print the tail of the daemon's runtime crash log after a non-zero exit.
+   *
+   * Best-effort and deliberately quiet on failure: an older daemon binary has no
+   * crash log, and a missing file must read as "not armed" rather than as a
+   * second error stacked on top of the crash we are trying to explain.
+   */
+  private reportCrash(): void {
+    try {
+      const path = join(this.cwdKey(), '.rysh', 'logs', `daemon-${this.sessionName}.crash`)
+      const text = readFileSync(path, 'utf-8')
+      if (!text.trim()) return
+      // Only the last run's section: the file is append-only across daemons, and
+      // printing all of it would bury today's crash under every earlier one.
+      const runs = text.split(/^=== /m)
+      const last = runs[runs.length - 1] || ''
+      const lines = last.split('\n')
+      const head = lines.slice(0, 60)
+      console.error(
+        `[sidecar] crash report (${path}):\n=== ${head.join('\n')}` +
+          (lines.length > head.length ? `\n… ${lines.length - head.length} more lines in the file` : '')
+      )
+    } catch {
+      /* no crash log — older daemon, or it never got to write one */
+    }
   }
 
   /**

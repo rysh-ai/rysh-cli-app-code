@@ -24,7 +24,10 @@ export type ClipboardSource =
   | 'chat_output'
   | 'external_output'
   | 'vt_screen'
-  | 'remote_vt_screen';
+  | 'remote_vt_screen'
+  // An agents-board pane's board as unwrapped messages (design 049) — the
+  // text `##board copy` and the TUI's y / Y produce.
+  | 'board';
 
 /**
  * The buffer that matches what the pane is SHOWING — the mirror of Body's
@@ -39,10 +42,14 @@ export type ClipboardSource =
  * instead of silent.
  */
 export function clipboardSourceFor(
-  pane: Pick<PaneSnapshot, 'raw_mode' | 'remote_interactive'>,
+  pane: Pick<PaneSnapshot, 'raw_mode' | 'remote_interactive' | 'pane_type'>,
   inputMode: string,
   isActive = true
 ): ClipboardSource {
+  // A board pane is shell-less: what it shows is the board, never a buffer.
+  // A daemon that predates `board` refuses it by name, which beats copying
+  // the stale text its `output` holds.
+  if (pane.pane_type === 'agents-board') return 'board';
   if (paneShowsLiveApp(pane, isActive, inputMode as never)) {
     return pane.remote_interactive ? 'remote_vt_screen' : 'vt_screen';
   }
