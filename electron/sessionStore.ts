@@ -32,6 +32,11 @@ export interface AppSession {
    * have one; command-line ones start theirs on demand.
    */
   webPort: number
+  /**
+   * A command-line control door's own secret file (0600, written by the daemon
+   * when no app handed it one). Empty when there is none.
+   */
+  webControlSecretFile: string
 }
 
 /** Shape of the JSON the daemon writes (snake_case keys). */
@@ -43,6 +48,7 @@ interface RawRecord {
   app_clients?: number
   pid?: number
   web_port?: number
+  web_control_secret_file?: string
 }
 
 /**
@@ -85,6 +91,7 @@ export function listSessions(workspaceRoot: string): AppSession[] {
         appClients: typeof rec.app_clients === 'number' ? rec.app_clients : 0,
         pid: typeof rec.pid === 'number' ? rec.pid : 0,
         webPort: typeof rec.web_port === 'number' ? rec.web_port : 0,
+        webControlSecretFile: typeof rec.web_control_secret_file === 'string' ? rec.web_control_secret_file : '',
       })
     } catch {
       // Skip unreadable / malformed records.

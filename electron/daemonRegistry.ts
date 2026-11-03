@@ -1,5 +1,6 @@
 import { app } from 'electron'
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
+import { randomBytes } from 'crypto'
+import { chmodSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync, mkdirSync } from 'fs'
 import { dirname, join } from 'path'
 
 /** Fixed, instance-independent directory name for shared app state. */
@@ -33,6 +34,12 @@ export interface DaemonRecord {
    * which is all the registry held before CLI adoption.
    */
   origin?: DaemonOrigin
+  /**
+   * The daemon's per-launch secret for its local connection, kept so a later
+   * launch can re-adopt it. This is why the file is written 0600. Absent on
+   * records from before the secret existed (such a daemon needs none).
+   */
+  controlSecret?: string
 }
 
 export type DaemonOrigin = 'app' | 'cli'
@@ -59,10 +66,10 @@ export function isPidAlive(pid: number): boolean {
  * The file lives in a SHARED, instance-independent directory (under appData, not
  * any one instance's userData) so EVERY running instance sees EVERY instance's
  * daemons. This is essential for two reasons:
- *   1. killStaleSidecars reaps orphaned daemons by binary path; without a shared
- *      view, a secondary instance would reap the primary's live daemons (and
- *      vice versa). Listing all instances' live pids in one place keeps each
- *      instance's reaper from touching another's.
+ *   1. killStaleSidecars takes its candidates only from this registry (and the
+ *      session record) for the one (cwd, session) it is starting, so each
+ *      instance sees the daemon recorded for that key whichever instance
+ *      recorded it, and never touches another key's daemons.
  *   2. A daemon detached by one instance can be re-adopted by any later launch,
  *      regardless of which slot it lands on (adoption is keyed by cwd+session,
  *      not by instance).
@@ -79,7 +86,9 @@ export class DaemonRegistry {
   constructor(instanceId = 0) {
     this.instanceId = instanceId
     const sharedDir = join(app.getPath('appData'), SHARED_DIR_NAME)
-    mkdirSync(sharedDir, { recursive: true })
+    // 0700: the registry holds each daemon's connection secret.
+    mkdirSync(sharedDir, { recursive: true, mode: 0o700 })
+    chmodSync(sharedDir, 0o700)
     this.filePath = join(sharedDir, 'running-daemons.json')
     this.records = []
     this.load()
@@ -126,8 +135,24 @@ export class DaemonRegistry {
 
   private save(): void {
     try {
-      mkdirSync(dirname(this.filePath), { recursive: true })
-      writeFileSync(this.filePath, JSON.stringify(this.records, null, 2), 'utf-8')
+      const dir = dirname(this.filePath)
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      // The records hold each daemon's secret, so the secret is only ever
+      // written into a NEW 0600 file ('wx'), which then replaces the registry
+      // in one rename. Writing into the existing file would briefly expose it
+      // under an older, looser mode.
+      const tmp = join(dir, `.running-daemons.${process.pid}.${randomBytes(6).toString('hex')}.tmp`)
+      try {
+        writeFileSync(tmp, JSON.stringify(this.records, null, 2), { encoding: 'utf-8', mode: 0o600, flag: 'wx' })
+        renameSync(tmp, this.filePath)
+      } catch (err) {
+        try {
+          unlinkSync(tmp)
+        } catch {
+          /* never created */
+        }
+        throw err
+      }
     } catch (err) {
       console.error('[daemonRegistry] Failed to save:', err)
     }
@@ -177,9 +202,8 @@ export class DaemonRegistry {
   }
 
   /**
-   * PIDs of all live preserved daemons across ALL instances. killStaleSidecars
-   * excludes these so neither a deliberately-detached daemon nor another running
-   * instance's daemon is reaped when an instance starts.
+   * PIDs of all live preserved daemons across ALL instances (pruning the dead
+   * ones from the file).
    */
   alivePids(): number[] {
     return this.prune().map((r) => r.pid)

@@ -4,8 +4,11 @@
 // password login set by `##rysh web auth username=<u> password=<p>` (or
 // `##rysh web start --username <u> --password <p>`), which returns a JWT valid
 // for 30 days. We keep that JWT in localStorage and present it as
-// `Authorization: Bearer …` on API calls and as ?token= on the WebSocket
-// upgrade (a browser cannot set headers on a WebSocket handshake).
+// `X-Rysh-Token: …` on API calls and as the WebSocket subprotocol
+// `rysh-auth.<jwt>` on the /ws upgrade (a browser cannot set headers on a
+// WebSocket handshake). It never goes in a URL, and Authorization is left
+// alone: /ryshweb sits behind nginx Basic auth, which needs that header for
+// itself (security-lead ledger 86).
 //
 // There is no refresh token by design. When the JWT expires the server stops
 // authenticating it, /api/auth/status reports authenticated:false, and the
@@ -61,8 +64,13 @@ export function clearToken(): void {
   }
 }
 
+/** The header that carries the login JWT on API calls. */
+export const TOKEN_HEADER = 'X-Rysh-Token';
+/** The /ws subprotocol the server selects; the JWT rides TOKEN_SUBPROTOCOL + '.' + jwt. */
+export const TOKEN_SUBPROTOCOL = 'rysh-auth';
+
 /**
- * fetch against the rysh web server: proxy-safe base, and the bearer token
+ * fetch against the rysh web server: proxy-safe base, and the login token
  * attached when we have one. Accepts absolute-looking paths ("/api/env") and
  * rewrites them onto apiBase().
  */
@@ -70,14 +78,20 @@ export function apiFetch(path: string, init: RequestInit = {}): Promise<Response
   const url = apiBase() + path.replace(/^\//, '');
   const token = getToken();
   const headers = new Headers(init.headers || {});
-  if (token) headers.set('Authorization', `Bearer ${token}`);
+  if (token) headers.set(TOKEN_HEADER, token);
   return fetch(url, { ...init, headers });
 }
 
-/** Suffix appended to the /ws query string so the upgrade carries the token. */
-export function wsAuthQuery(): string {
+/**
+ * Subprotocols to offer on the /ws upgrade so it carries the token: the plain
+ * name (the only one the server echoes) and the name with the JWT appended.
+ * Empty when nobody is signed in, and for a stored value that is not
+ * JWT-shaped: the WebSocket constructor throws on a non-token subprotocol, so
+ * a corrupted value is treated as signed out (the server then asks for a login).
+ */
+export function wsProtocols(): string[] {
   const token = getToken();
-  return token ? `&token=${encodeURIComponent(token)}` : '';
+  return /^[A-Za-z0-9._-]+$/.test(token) ? [TOKEN_SUBPROTOCOL, `${TOKEN_SUBPROTOCOL}.${token}`] : [];
 }
 
 export interface AuthStatus {

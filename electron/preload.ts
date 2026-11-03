@@ -1,4 +1,5 @@
 import type { FaceTimeAPI } from '../src/types/facetime'
+import type { RemoteSetupAPI } from '../src/types/remoteSetup'
 import { contextBridge, ipcRenderer } from 'electron'
 
 /**
@@ -27,6 +28,8 @@ export interface WorkspaceInfo {
 
 export interface ElectronAPI {
   facetime: FaceTimeAPI
+  /** Set up remote access (E33): drives the bundled `rysh setup`; credentials go to main once, on hold. */
+  remoteSetup: RemoteSetupAPI
   /** Opens a meeting's report.md (E-81); the main process accepts only that file. */
   openMeetingReport: (meetingId: string, path: string) => Promise<{ success: boolean; error?: string }>
   // App info
@@ -112,6 +115,14 @@ const api: ElectronAPI = {
     contacts: (search, offset = 0) => ipcRenderer.invoke('facetime-contacts', search, offset),
     call: (contactID, addressID, expectedValue) => ipcRenderer.invoke('facetime-call', contactID, addressID, expectedValue),
     cancel: () => ipcRenderer.invoke('facetime-cancel'),
+  },
+  remoteSetup: {
+    steps: (channel) => ipcRenderer.invoke('remote-setup:steps', channel),
+    hold: (channel, creds) => ipcRenderer.invoke('remote-setup:hold', channel, creds),
+    apply: (handle, owner) => ipcRenderer.invoke('remote-setup:apply', handle, owner),
+    verify: (channel) => ipcRenderer.invoke('remote-setup:verify', channel),
+    bindings: () => ipcRenderer.invoke('remote-setup:bindings'),
+    cancel: () => ipcRenderer.invoke('remote-setup:cancel'),
   },
   openMeetingReport: (meetingId, path) => ipcRenderer.invoke('meeting-open-report', meetingId, path),
   // App info

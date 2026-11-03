@@ -33,6 +33,7 @@ interface WorkspaceInfo {
 
 interface ElectronAPI {
   facetime: import('./types/facetime').FaceTimeAPI
+  remoteSetup: import('./types/remoteSetup').RemoteSetupAPI
   /** Opens a meeting's report.md (E-81); the main process accepts only that file. */
   openMeetingReport: (meetingId: string, path: string) => Promise<{ success: boolean; error?: string }>
   getPort: () => Promise<number>

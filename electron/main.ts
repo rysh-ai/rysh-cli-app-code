@@ -2,7 +2,9 @@ import { app, BrowserWindow, dialog, shell, session } from 'electron'
 import { join, basename } from 'path'
 import { is } from '@electron-toolkit/utils'
 import { SidecarManager, resolveSidecarBinaryPath } from './sidecar'
+import { installControlSecretHeader } from './controlSecret'
 import { registerFaceTimeHandlers } from './facetime'
+import { CliRemoteSetupRunner, registerRemoteSetupHandlers } from './remoteSetup'
 import { registerMeetingReportHandler } from './meetingReport'
 import { pathToFileURL } from 'node:url'
 import { WebPaneManager } from './webPaneManager'
@@ -217,6 +219,7 @@ function createWindow(): BrowserWindow {
     ? process.env['ELECTRON_RENDERER_URL']
     : pathToFileURL(join(__dirname, '../renderer/index.html')).href
   registerFaceTimeHandlers(win, rendererURL, resolveSidecarBinaryPath)
+  registerRemoteSetupHandlers(win, rendererURL, new CliRemoteSetupRunner(resolveSidecarBinaryPath, () => workspaceManager?.getCurrent()?.path ?? null))
   registerMeetingReportHandler(win, rendererURL)
   return win
 }
@@ -251,13 +254,16 @@ async function adoptOrStart(
   dirPath: string
 ): Promise<boolean> {
   const known = sidecar.getRegistry().findAlive(dirPath, sessionName)
-  if (known && (await sidecar.adopt(sessionName, dirPath, known.webPort, known.pid, known.origin ?? 'app'))) {
+  if (
+    known &&
+    (await sidecar.adopt(sessionName, dirPath, known.webPort, known.pid, known.origin ?? 'app', known.controlSecret ?? null))
+  ) {
     return true
   }
 
   const found = await sidecar.ensureWebEndpoint(sessionName, dirPath)
   if (found.kind === 'endpoint') {
-    if (await sidecar.adopt(sessionName, dirPath, found.port, found.pid, found.origin)) {
+    if (await sidecar.adopt(sessionName, dirPath, found.port, found.pid, found.origin, found.controlSecret ?? null)) {
       return true
     }
     throw new Error(
@@ -661,6 +667,18 @@ app.whenReady().then(async () => {
   session.defaultSession.setPermissionCheckHandler((wc, permission) =>
     allowMediaForMain(wc ?? undefined, permission)
   )
+
+  // The daemon's local connection needs its per-launch secret. Main attaches it
+  // as a header, only to the main window's requests to that daemon's exact
+  // ws/http://127.0.0.1:<port>; the renderer never holds it. Web panes use
+  // their own session partitions and never reach this hook. Read per request,
+  // so a workspace switch (new daemon, port and secret) needs nothing here.
+  installControlSecretHeader(session.defaultSession, () => {
+    const w = mainWindow
+    const sc = sidecarManager
+    if (!w || w.isDestroyed() || !sc) return null
+    return { webContentsId: w.webContents.id, port: sc.getPort(), secret: sc.getControlSecret() ?? '' }
+  })
 
   // Boot policy: if THIS instance's profile previously had a workspace open
   // (and it wasn't explicitly closed), reopen it now — same workspace, same

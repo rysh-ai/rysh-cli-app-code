@@ -29,3 +29,6 @@ Thumbs.db
 
 # Rysh runtime/session state (NATS JetStream, sessions, secrets KV) — never commit
 .rysh/
+
+# make start/dev/stop/status run records (scripts/local-run.sh, E12 order 30a)
+.run/

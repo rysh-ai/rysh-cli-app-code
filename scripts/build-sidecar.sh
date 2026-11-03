@@ -41,7 +41,8 @@ for target in "${TARGETS[@]}"; do
   IFS=':' read -r goos goarch suffix <<< "$target"
   output="$SIDECAR_DIR/rysh-$suffix"
   echo "  Building: GOOS=$goos GOARCH=$goarch → $output"
-  (cd "$GO_SRC" && GOWORK=off GOOS="$goos" GOARCH="$goarch" go build -ldflags="$LDFLAGS" -o "$output" ./cmd/rysh)
+  # -trimpath: no builder path (HOME, username, module cache) in the binary (E12 order 29a)
+  (cd "$GO_SRC" && GOWORK=off GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="$LDFLAGS" -o "$output" ./cmd/rysh)
 done
 
 echo ""

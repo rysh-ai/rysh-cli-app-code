@@ -5,7 +5,18 @@ import { app } from 'electron'
 import { is } from '@electron-toolkit/utils'
 import * as http from 'http'
 import { DaemonRegistry, isPidAlive, type DaemonOrigin } from './daemonRegistry'
+import {
+  CONTROL_SECRET_FILE_ENV,
+  CONTROL_SECRET_FILE_FLAG,
+  hasWhitespace,
+  makeControlSecret,
+  makeHandoverDir,
+  readSecretFile,
+  removeHandoverFile,
+  writeHandoverFile,
+} from './controlSecret'
 import { findSession } from './sessionStore'
+import { reapStaleSidecars, staleCandidates } from './sidecarReaper'
 
 /**
  * The embedded-NATS port rysh-cli falls back to when none is configured
@@ -25,7 +36,7 @@ const DEFAULT_NATS_PORT = 24242
  *   ws.* subjects as the first.
  */
 export type EndpointLookup =
-  | { kind: 'endpoint'; port: number; pid: number; origin: DaemonOrigin }
+  | { kind: 'endpoint'; port: number; pid: number; origin: DaemonOrigin; controlSecret?: string | null }
   | { kind: 'none' }
   | { kind: 'unreachable'; pid: number; reason: string }
 
@@ -58,6 +69,10 @@ export class SidecarManager {
   // default. Paired with natsPort so each instance runs an independent broker.
   private natsDataDir: string | null = null
   private readonly registry: DaemonRegistry
+  // The current daemon's per-launch secret for its local connection (see
+  // controlSecret.ts). null = none known: an adopted daemon from before the
+  // secret existed, which needs none. Never logged.
+  private controlSecret: string | null = null
 
   constructor(instanceId = 0) {
     // The registry is shared across instances; stamping our instanceId keeps the
@@ -134,7 +149,10 @@ export class SidecarManager {
     // The session record says which front-end started the daemon.
     const origin: DaemonOrigin = rec.source === 'app' ? 'app' : 'cli'
     if (rec.webPort > 0 && (await this.probeHealth(rec.webPort))) {
-      return { kind: 'endpoint', port: rec.webPort, pid: rec.pid, origin }
+      // A command-line control door made its own secret and named the 0600
+      // file in its record; readSecretFile refuses anything looser.
+      const controlSecret = readSecretFile(rec.webControlSecretFile)
+      return { kind: 'endpoint', port: rec.webPort, pid: rec.pid, origin, controlSecret }
     }
 
     // Live daemon, no reachable web server — ask it to open one.
@@ -144,22 +162,47 @@ export class SidecarManager {
     } catch {
       return { kind: 'unreachable', pid: rec.pid, reason: 'no free port for a web server' }
     }
+    // The door gets a per-launch secret, handed over by a 0600 file whose path
+    // (not the secret) goes on the command line. The daemon reads and deletes
+    // it; the finally below is the backstop.
+    const controlSecret = makeControlSecret()
+    let handover: string
     try {
-      execFileSync(
-        this.resolveBinaryPath(),
-        // --control is what makes this startable at all: a user-invoked
-        // `##rysh web start` demands a username/password login, while control
-        // mode is loopback-only and serves just this app.
-        ['web', 'start', sessionName, '--control', '--port', String(port)],
-        { cwd, env: { ...process.env, HOME: app.getPath('home') }, timeout: 20000, stdio: 'pipe' }
-      )
+      handover = writeHandoverFile(makeHandoverDir(), controlSecret)
     } catch (err) {
       return {
         kind: 'unreachable',
         pid: rec.pid,
-        reason: `could not request a web server: ${err instanceof Error ? err.message : err}`,
+        reason: `could not prepare the connection secret: ${err instanceof Error ? err.message : err}`,
       }
     }
+    // The path is typed into a pane, where whitespace splits it; the CLI
+    // refuses such a path, so say so here instead of a vague timeout.
+    if (hasWhitespace(handover)) {
+      removeHandoverFile(handover)
+      return {
+        kind: 'unreachable',
+        pid: rec.pid,
+        reason: 'the temp dir for the connection secret has whitespace in its path (set TMPDIR to a path without spaces)',
+      }
+    }
+    try {
+      try {
+        execFileSync(
+          this.resolveBinaryPath(),
+          // --control is what makes this startable at all: a user-invoked
+          // `##rysh web start` demands a username/password login, while control
+          // mode is loopback-only and serves just this app.
+          ['web', 'start', sessionName, '--control', '--port', String(port), CONTROL_SECRET_FILE_FLAG, handover],
+          { cwd, env: { ...process.env, HOME: app.getPath('home') }, timeout: 20000, stdio: 'pipe' }
+        )
+      } catch (err) {
+        return {
+          kind: 'unreachable',
+          pid: rec.pid,
+          reason: `could not request a web server: ${err instanceof Error ? err.message : err}`,
+        }
+      }
 
     // `rysh web start` is FIRE-AND-FORGET: it sends `##rysh web start` into the
     // session's active pane and returns immediately, so the exec above
@@ -170,19 +213,23 @@ export class SidecarManager {
     for (let i = 0; i < 20; i++) {
       await new Promise((r) => setTimeout(r, 300))
       const fresh = findSession(cwd, sessionName)
-      if (fresh && fresh.webPort > 0 && (await this.probeHealth(fresh.webPort))) {
-        return {
-          kind: 'endpoint',
-          port: fresh.webPort,
-          pid: fresh.pid || rec.pid,
-          origin,
+        if (fresh && fresh.webPort > 0 && (await this.probeHealth(fresh.webPort))) {
+          return {
+            kind: 'endpoint',
+            port: fresh.webPort,
+            pid: fresh.pid || rec.pid,
+            origin,
+            controlSecret,
+          }
         }
       }
-    }
-    return {
-      kind: 'unreachable',
-      pid: rec.pid,
-      reason: 'its web server never advertised a reachable port',
+      return {
+        kind: 'unreachable',
+        pid: rec.pid,
+        reason: 'its web server never advertised a reachable port',
+      }
+    } finally {
+      removeHandoverFile(handover)
     }
   }
 
@@ -196,7 +243,14 @@ export class SidecarManager {
    * port. Returns true on success; on failure the caller should fall back to
    * start() (cold restore from KV).
    */
-  async adopt(sessionName: string, cwd: string, webPort: number, pid: number, origin: DaemonOrigin = 'app'): Promise<boolean> {
+  async adopt(
+    sessionName: string,
+    cwd: string,
+    webPort: number,
+    pid: number,
+    origin: DaemonOrigin = 'app',
+    controlSecret: string | null = null
+  ): Promise<boolean> {
     if (!isPidAlive(pid)) {
       this.registry.remove(cwd, sessionName)
       return false
@@ -215,6 +269,10 @@ export class SidecarManager {
     this.process = null
     this.adoptedPid = pid
     this.adoptedOrigin = origin
+    // A command-line daemon's door may have been reopened with a new secret
+    // since we stored one; its record names the current 0600 file.
+    const fromRecord = origin === 'cli' ? readSecretFile(findSession(cwd, sessionName)?.webControlSecretFile) : null
+    this.controlSecret = fromRecord || controlSecret || null
     this.stopping = false
     this.restartCount = 0
     this.registry.record({
@@ -224,6 +282,7 @@ export class SidecarManager {
       webPort,
       updatedAt: new Date().toISOString(),
       origin,
+      ...(this.controlSecret ? { controlSecret: this.controlSecret } : {}),
     })
     console.log(`[sidecar] Adopted running ${origin} daemon pid=${pid} session=${sessionName} (web port: ${webPort})`)
     return true
@@ -243,6 +302,7 @@ export class SidecarManager {
     if (this.process) this.process.removeAllListeners('exit')
     this.process = null
     this.adoptedPid = null
+    this.controlSecret = null // the registry keeps it for the next adopt
     this.stopping = true // suppress any auto-restart path
     console.log(`[sidecar] Detached daemon pid=${pid} session=${this.sessionName} (left running)`)
     return pid
@@ -257,14 +317,15 @@ export class SidecarManager {
     this.stopping = false
     this.adoptedPid = null
     this.adoptedOrigin = 'app'
+    this.controlSecret = null
     // Reap any sidecar left over from a previous run BEFORE starting a new one.
     // A force-quit or crash skips before-quit (so stop() never ran) and leaves
     // the detached daemon alive. Two daemons for the same session on a shared
     // NATS server each spawn a WorkspaceActor, so snapshot requests get answered
     // by both with diverged state — the workspace appears to flap between two
     // sets of tabs/panes. Killing the stale daemon guarantees a single actor.
-    // Deliberately-detached daemons (in the registry) are excluded from reaping.
-    this.killStaleSidecars()
+    // Only this session's own recorded daemon is a candidate, after an identity check.
+    await this.killStaleSidecars()
 
     this.port = await this.findFreePort()
     const binaryPath = this.resolveBinaryPath()
@@ -300,6 +361,13 @@ export class SidecarManager {
       RYSH_SESSION_SOURCE: 'app',
       HOME: app.getPath('home'),
     }
+    // The per-launch secret for the local connection: by a 0600 file whose
+    // path is in the env, never argv. The daemon reads and deletes it; the
+    // finally after the health wait is the backstop.
+    const controlSecret = makeControlSecret()
+    const handover = writeHandoverFile(makeHandoverDir(), controlSecret)
+    env[CONTROL_SECRET_FILE_ENV] = handover
+    this.controlSecret = controlSecret
     // Secondary instances pin their daemons to a private embedded-NATS port AND
     // a private JetStream store so each instance runs its OWN broker — instances
     // never share one NATS server, so quitting one can't tear down another's
@@ -315,70 +383,100 @@ export class SidecarManager {
       env.RYSH_NATS_DATA_DIR = natsDataDir
     }
 
-    this.process = spawn(binaryPath, ['daemon', this.sessionName], {
-      env,
-      // Never inherit the launcher's cwd: a Finder-launched app runs at "/",
-      // and the daemon anchors its session/NATS storage to a ".rysh" dir under
-      // cwd (rysh-cli rysh-dir storage), so mkdir "/.rysh" fails on the
-      // read-only root and the daemon exits → "disconnected". Fall back to the
-      // user's home (writable; matches rysh-cli's $HOME/.rysh convention) until
-      // a workspace sets an explicit working directory.
-      cwd,
-      // detached: the daemon becomes its own process-group leader so it can
-      // OUTLIVE this app process when the user detaches (the whole point — the
-      // backend keeps running with full in-memory state). unref() below lets the
-      // app event loop exit without waiting on it. The daemon also redirects its
-      // own stdio to /dev/null (goHeadless) shortly after start, so keeping the
-      // pipes here only captures early startup diagnostics.
-      detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    // Don't let the (detached) daemon keep the app's event loop alive; on detach
-    // we want the app to be able to quit while the daemon keeps running.
-    this.process.unref()
+    try {
+      this.process = spawn(binaryPath, ['daemon', this.sessionName], {
+        env,
+        // Never inherit the launcher's cwd: a Finder-launched app runs at "/",
+        // and the daemon anchors its session/NATS storage to a ".rysh" dir under
+        // cwd (rysh-cli rysh-dir storage), so mkdir "/.rysh" fails on the
+        // read-only root and the daemon exits → "disconnected". Fall back to the
+        // user's home (writable; matches rysh-cli's $HOME/.rysh convention) until
+        // a workspace sets an explicit working directory.
+        cwd,
+        // detached: the daemon becomes its own process-group leader so it can
+        // OUTLIVE this app process when the user detaches (the whole point — the
+        // backend keeps running with full in-memory state). unref() below lets the
+        // app event loop exit without waiting on it. The daemon also redirects its
+        // own stdio to /dev/null (goHeadless) shortly after start, so keeping the
+        // pipes here only captures early startup diagnostics.
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      // Don't let the (detached) daemon keep the app's event loop alive; on detach
+      // we want the app to be able to quit while the daemon keeps running.
+      this.process.unref()
 
-    // Log sidecar output
-    this.process.stdout?.on('data', (data: Buffer) => {
-      console.log(`[sidecar:stdout] ${data.toString().trim()}`)
-    })
+      // Log sidecar output
+      this.process.stdout?.on('data', (data: Buffer) => {
+        console.log(`[sidecar:stdout] ${data.toString().trim()}`)
+      })
 
-    this.process.stderr?.on('data', (data: Buffer) => {
-      console.error(`[sidecar:stderr] ${data.toString().trim()}`)
-    })
+      // The daemon's last few stderr lines: when it exits before it ever answers
+      // (a refused start, e.g. its project's bus port held by another project),
+      // that line is the reason, and start() fails with it at once.
+      const stderrTail: string[] = []
+      let answered = false
+      let failEarly: (err: Error) => void = () => {}
+      const exitedEarly = new Promise<never>((_resolve, reject) => {
+        failEarly = reject
+      })
+      exitedEarly.catch(() => {}) // observed through the race below
 
-    this.process.on('exit', (code, signal) => {
-      console.log(`[sidecar] Exited with code=${code} signal=${signal}`)
-      // A non-zero exit here used to be the end of the trail. The daemon goes
-      // headless shortly after start (goHeadless() dup2's /dev/null over fd 2),
-      // so the pipes above only ever caught startup output, and a Go panic —
-      // which is what exit status 2 IS — printed its report into /dev/null and
-      // left `code=2 signal=null` as the only evidence anywhere. The daemon now
-      // mirrors runtime crash reports to a file that survives that redirect
-      // (rysh-cli cmd/rysh/crashlog.go); print the tail of it right here so the
-      // cause sits next to the exit instead of in a file nobody knows about.
-      if (code !== 0 && code !== null) this.reportCrash()
-      this.process = null
+      this.process.stderr?.on('data', (data: Buffer) => {
+        const text = data.toString().trim()
+        console.error(`[sidecar:stderr] ${text}`)
+        for (const line of text.split('\n')) {
+          if (line.trim()) stderrTail.push(line.trim())
+        }
+        stderrTail.splice(0, Math.max(0, stderrTail.length - 5))
+      })
 
-      if (!this.stopping && this.restartCount < this.maxRestarts) {
-        this.restartCount++
-        console.log(`[sidecar] Restarting (attempt ${this.restartCount}/${this.maxRestarts})...`)
-        const delay = Math.min(1000 * Math.pow(2, this.restartCount - 1), 10000)
-        setTimeout(() => {
-          this.start().catch((err) => {
-            console.error('[sidecar] Restart failed:', err)
-          })
-        }, delay)
-      }
-    })
+      this.process.on('exit', (code, signal) => {
+        console.log(`[sidecar] Exited with code=${code} signal=${signal}`)
+        // A non-zero exit here used to be the end of the trail. The daemon goes
+        // headless shortly after start (goHeadless() dup2's /dev/null over fd 2),
+        // so the pipes above only ever caught startup output, and a Go panic —
+        // which is what exit status 2 IS — printed its report into /dev/null and
+        // left `code=2 signal=null` as the only evidence anywhere. The daemon now
+        // mirrors runtime crash reports to a file that survives that redirect
+        // (rysh-cli cmd/rysh/crashlog.go); print the tail of it right here so the
+        // cause sits next to the exit instead of in a file nobody knows about.
+        if (code !== 0 && code !== null) this.reportCrash()
+        this.process = null
 
-    this.process.on('error', (err) => {
-      console.error('[sidecar] Process error:', err)
-    })
+        // A start that never came up is not restarted: it would only meet the
+        // same refusal three more times while the user waits. Report it now.
+        if (!answered) {
+          const how = code !== null ? `code ${code}` : `signal ${signal}`
+          const last = stderrTail[stderrTail.length - 1]
+          failEarly(new Error(`the daemon exited (${how}) before it answered${last ? `: ${last}` : ' (it printed nothing)'}`))
+          return
+        }
 
-    // Wait for the web server to become healthy (longer timeout since
-    // the daemon needs to start NATS, restore KV state, spawn actors,
-    // then auto-start the web server).
-    await this.waitForHealthy(30000)
+        if (!this.stopping && this.restartCount < this.maxRestarts) {
+          this.restartCount++
+          console.log(`[sidecar] Restarting (attempt ${this.restartCount}/${this.maxRestarts})...`)
+          const delay = Math.min(1000 * Math.pow(2, this.restartCount - 1), 10000)
+          setTimeout(() => {
+            this.start().catch((err) => {
+              console.error('[sidecar] Restart failed:', err)
+            })
+          }, delay)
+        }
+      })
+
+      this.process.on('error', (err) => {
+        console.error('[sidecar] Process error:', err)
+      })
+
+      // Wait for the web server to become healthy (longer timeout since
+      // the daemon needs to start NATS, restore KV state, spawn actors,
+      // then auto-start the web server).
+      await Promise.race([this.waitForHealthy(30000), exitedEarly])
+      answered = true
+    } finally {
+      removeHandoverFile(handover)
+    }
     this.restartCount = 0 // Reset on successful start
 
     // Record the live daemon so a later app run (after Detach) can find and
@@ -392,6 +490,7 @@ export class SidecarManager {
         pid,
         webPort: this.port,
         updatedAt: new Date().toISOString(),
+        controlSecret,
       })
     }
   }
@@ -422,6 +521,7 @@ export class SidecarManager {
    */
   async stop(): Promise<void> {
     this.stopping = true
+    this.controlSecret = null
     const cwd = this.cwdKey()
     const session = this.sessionName
     // Forget the daemon SYNCHRONOUSLY, before any await or kill: app quit calls
@@ -502,6 +602,15 @@ export class SidecarManager {
   }
 
   /**
+   * The current daemon's per-launch connection secret, or null when none is
+   * known. Main reads it only to attach the header to the app window's
+   * requests; it never goes to the renderer.
+   */
+  getControlSecret(): string | null {
+    return this.controlSecret
+  }
+
+  /**
    * Get the current session name.
    */
   getSessionName(): string {
@@ -577,55 +686,37 @@ export class SidecarManager {
   }
 
   /**
-   * Kill orphaned sidecar daemons started from THIS app's bundled binary.
-   * Matched by the binary's full path (unique to the app), so it never touches
-   * the user's own `rysh`/`ry` CLI sessions. SIGKILL (not graceful) so the
-   * stale daemon stops writing the shared session KV immediately, before the
-   * fresh daemon restores from it.
+   * Stop a stale daemon for the session about to start: one left running by a
+   * force-quit or crash, which skips before-quit, so stop() never ran. Two
+   * daemons for one session would each answer its ws.* subjects.
    *
-   * Crucially, daemons we deliberately left running (Detach) are in the registry
-   * and are EXCLUDED from reaping — otherwise launching a fresh app instance
-   * would kill the very daemon we want to adopt. Best-effort throughout.
+   * The candidates come only from the app's own records for THIS (cwd,
+   * session): the registry's pid, if the app started that daemon, and the
+   * session record's pid, if the app created the session. Nothing is looked up
+   * by pattern, so the user's own `rysh`/`ry` processes, command-line daemons
+   * and other sessions' daemons are never candidates. Each candidate must then
+   * pass the identity check in sidecarReaper.ts (its own executable is the
+   * sidecar binary, and it leads the group spawn() created for it) before it
+   * gets SIGTERM, then SIGKILL after a bounded wait. (E12 order 31.)
+   *
+   * Only reached when adoption failed or found nothing (main.ts adoptOrStart),
+   * or on a restart, so a recorded daemon here is one the app cannot use.
    */
-  private killStaleSidecars(): void {
-    const binaryPath = this.resolveBinaryPath()
-    const preserve = new Set(this.registry.alivePids())
-    const selfPid = this.getPid()
-    if (selfPid > 0) preserve.add(selfPid)
-
+  private async killStaleSidecars(): Promise<void> {
+    if (process.platform !== 'darwin' && process.platform !== 'linux') return // no identity reader: fail closed
+    const cwd = this.cwdKey()
+    const session = this.sessionName
+    const rec = this.registry.find(cwd, session)
+    const pids = staleCandidates(rec, findSession(cwd, session), [process.pid, this.getPid()])
+    if (pids.length === 0) return
     try {
-      if (process.platform === 'win32') {
-        // No easy PID-exclusion with taskkill /IM; if we have daemons to
-        // preserve, skip reaping rather than risk killing a detached one.
-        if (preserve.size > 0) return
-        const image = binaryPath.split('\\').pop() || 'rysh-win-x64.exe'
-        execFileSync('taskkill', ['/F', '/IM', image], { stdio: 'ignore' })
-        console.log('[sidecar] Reaped stale sidecar process(es)')
-        return
-      }
-
-      // Unix: enumerate matching daemon PIDs and SIGKILL only the unpreserved.
-      let out = ''
-      try {
-        out = execFileSync('pgrep', ['-f', binaryPath], { encoding: 'utf-8' })
-      } catch {
-        out = '' // pgrep exits non-zero when nothing matched
-      }
-      const pids = out
-        .split('\n')
-        .map((s) => parseInt(s.trim(), 10))
-        .filter((p) => p > 0 && p !== process.pid && !preserve.has(p))
-      for (const pid of pids) {
-        try {
-          process.kill(pid, 'SIGKILL')
-        } catch {
-          /* already gone */
-        }
-      }
-      if (pids.length > 0) console.log(`[sidecar] Reaped ${pids.length} stale sidecar process(es)`)
-    } catch {
-      // Tool missing / nothing matched — nothing to do.
+      const reaped = await reapStaleSidecars(pids, this.resolveBinaryPath())
+      if (reaped.length > 0) console.log(`[sidecar] Stopped ${reaped.length} stale sidecar daemon(s): pid ${reaped.join(', ')}`)
+    } catch (err) {
+      console.warn('[sidecar] Stale-daemon check failed; nothing stopped:', err)
     }
+    // A record whose daemon is gone is stale: drop it.
+    if (rec && !isPidAlive(rec.pid)) this.registry.remove(cwd, session)
   }
 
   /**

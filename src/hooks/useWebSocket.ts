@@ -4,7 +4,7 @@ import { sendCommand } from '../utils/commands';
 import { resolveCompletionResult } from '../utils/completion';
 import { resolveMeetingToken } from '../meeting/daemonToken';
 import { resolveMeetingReply } from '../meeting/controls';
-import { wsAuthQuery } from '../utils/auth';
+import { wsProtocols } from '../utils/auth';
 import { resendVisiblePanes } from '../utils/visiblePanes';
 
 /**
@@ -82,6 +82,7 @@ export function useWebSocket() {
       }
 
       let wsUrl: string;
+      let protocols: string[] = [];
       if (window.electronAPI && sidecarPort) {
         // Electron mode: connect to sidecar on localhost (content-plane
         // stream). No credential to present: the app's daemons run in control
@@ -92,13 +93,15 @@ export function useWebSocket() {
         // Browser mode: use page origin (content-plane stream).
         //
         // The login JWT lives in localStorage, and a browser cannot set
-        // headers on a WebSocket handshake, so it goes in the query string,
-        // which the server accepts for exactly this reason.
+        // headers on a WebSocket handshake, so it is offered as a
+        // subprotocol; never in the URL, where proxies and access logs
+        // would record it.
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        wsUrl = `${proto}//${location.host}/ws?stream=1${wsAuthQuery()}`;
+        wsUrl = `${proto}//${location.host}/ws?stream=1`;
+        protocols = wsProtocols();
       }
 
-      const ws = new WebSocket(wsUrl);
+      const ws = protocols.length > 0 ? new WebSocket(wsUrl, protocols) : new WebSocket(wsUrl);
 
       ws.onopen = () => {
         if (unmounted) { ws.close(); return; }

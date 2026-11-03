@@ -136,7 +136,7 @@ async function finalize(): Promise<void> {
       res = await api.transcribe(buf, type);
     } else if (transcriberAvailable()) {
       // Web mode: same-origin server-side transcription (apiFetch carries the
-      // access-token cookie and the login bearer token; the provider key stays
+      // access-token cookie and the login token; the provider key stays
       // on the server).
       const resp = await apiFetch('/api/voice/transcribe', {
         method: 'POST',

@@ -44,6 +44,10 @@ if [[ -z "$DEB" ]]; then
 fi
 [[ -n "$DEB" && -f "$DEB" ]] || { echo "FATAL: no .deb found; see verify-linux-deb.sh" >&2; exit 2; }
 DEB_ABS="$(cd "$(dirname "$DEB")" && pwd)/$(basename "$DEB")"
+# E12 order 30, the rest: inside the container, liveness and stops go by RECORDED pid only
+# (scripts/lib-own-procs.sh + scripts/verify/lib-verify-procs.sh, mounted read-only): the app
+# it launched, and the daemon the app recorded in its registry under the fresh HOME.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; SCRIPTS="$(cd "$HERE/.." && pwd)"
 
 # Two knobs so a slow machine is a longer wait rather than a false negative.
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-120}"
@@ -52,10 +56,15 @@ CMD_TIMEOUT="${CMD_TIMEOUT:-60}"
 docker run --rm --platform linux/amd64 \
   -e BOOT_TIMEOUT="$BOOT_TIMEOUT" -e CMD_TIMEOUT="$CMD_TIMEOUT" \
   -v "$DEB_ABS":/pkg/app.deb:ro \
+  -v "$SCRIPTS/lib-own-procs.sh":/e12/lib-own-procs.sh:ro \
+  -v "$HERE/lib-verify-procs.sh":/e12/lib-verify-procs.sh:ro \
   ubuntu:22.04 bash -euo pipefail -c '
     fail=0
     ok()  { echo "OK   $*"; }
     bad() { echo "FAIL $*"; fail=1; }
+    . /e12/lib-own-procs.sh; . /e12/lib-verify-procs.sh
+    OWN_REC=/tmp/own-procs.tsv; : >"$OWN_REC"
+    trap own_cleanup EXIT
 
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
@@ -81,22 +90,27 @@ docker run --rm --platform linux/amd64 \
     xvfb-run -a "$APP" --no-sandbox --remote-debugging-port=9222 \
       > /tmp/app.log 2>&1 &
     APP_PID=$!
+    own_record "$APP_PID" || echo "     note: app pid $APP_PID is NOT recorded; it will not be signalled"
 
     # ---- BOX 431: did it reach a usable state? -------------------------------
     # "Usable" is asserted from three independent signals rather than a
     # screenshot: the process survives, the app spawned its daemon, and that
     # daemon answers HTTP. A blank-screen dead end fails the second and third.
-    boot_ok=0
+    # The daemon pid comes from the app: it records each daemon it spawns, once healthy, in
+    # running-daemons.json under the (fresh) HOME. It counts only if its executable is the
+    # bundled sidecar found above.
+    boot_ok=0; DPID=""
     for i in $(seq 1 "$BOOT_TIMEOUT"); do
       if ! kill -0 $APP_PID 2>/dev/null; then
         bad "app process exited during startup after ${i}s"
         echo "---- app log ----"; tail -40 /tmp/app.log; break
       fi
-      if pgrep -f "rysh-linux-x64 daemon" >/dev/null 2>&1; then boot_ok=1; break; fi
+      if DPID="$(registry_pid "$(registry_file "$HOME")" "*")" && daemon_record "$DPID" "$(readlink -f "$SIDE")"; then boot_ok=1; break; fi
+      DPID=""
       sleep 1
     done
     if [ "$boot_ok" = "1" ]; then
-      ok "app spawned its sidecar daemon (pid $(pgrep -f "rysh-linux-x64 daemon" | head -1))"
+      ok "app spawned its sidecar daemon (pid $DPID, from the app registry; executable $(readlink -f "$SIDE"))"
     else
       bad "no sidecar daemon after ${BOOT_TIMEOUT}s"
       echo "---- app log ----"; tail -40 /tmp/app.log
@@ -156,7 +170,8 @@ docker run --rm --platform linux/amd64 \
       fi
     fi
 
-    kill $APP_PID 2>/dev/null || true
+    stop_own "$APP_PID" "" 5 || true
+    if [ -n "$DPID" ]; then stop_own "$DPID" group 10 || true; fi
     echo
     if [ "$fail" = "0" ]; then
       echo "PASS — boxes 431 and 432 hold on this platform."

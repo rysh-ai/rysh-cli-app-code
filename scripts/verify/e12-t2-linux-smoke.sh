@@ -3,7 +3,8 @@
 # e12-t2-linux-smoke.sh — run the RELEASED Linux desktop artifact on a real
 # x86-64 machine and check the two T2 boxes (E12; docs/RELEASE-PLAN.md §6):
 #
-#   BOX 2  first launch with no ~/.config/rysh reaches a usable state
+#   BOX 2  first launch with no ~/.config/rysh reaches a usable state — since E-90
+#          (faad2e7) that is ~/rysh-workspace created and opened (lib-t2-box2.sh)
 #   BOX 3  a pane opens and runs a command
 #
 # Runs natively on the runner (ubuntu-22.04, x86-64), not in an emulated
@@ -16,7 +17,8 @@
 #
 # HOW BOX 3 IS DRIVEN — this bounds the claim, so it is stated up front.
 # electron/main.ts boots a fresh instance with NO daemon ("Boot policy: a fresh
-# instance starts with NO daemon and an empty (welcome) screen"); the daemon is
+# instance starts with NO daemon and an empty (welcome) screen"; since E-90 a FIRST run opens
+# ~/rysh-workspace instead, see BOX 2); the daemon is
 # started only when a workspace is opened, and opening one goes through a native
 # folder dialog that cannot be clicked headless. The app's OTHER entry to the
 # same code path is its relaunch path: WorkspaceManager.getLast() reads
@@ -39,6 +41,14 @@ OUT="$(cd "$OUT" && pwd)"
 SESSION=e12smoke
 BOOT_WAIT="${BOOT_WAIT:-40}"
 fail=0
+# E12 order 30, the rest: no pattern lookup or pattern kill. Every process this script signals
+# is one it RECORDED (scripts/lib-own-procs.sh: executable + pgid, checked again before each
+# signal): the app it launched, and the daemons that app recorded in its own registry under
+# the fresh HOME (scripts/verify/lib-verify-procs.sh).
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$HERE/../lib-own-procs.sh"; . "$HERE/lib-verify-procs.sh"; . "$HERE/lib-t2-box2.sh"
+OWN_REC="$OUT/$LABEL-own-procs.tsv"; : >"$OWN_REC"
+trap 'own_cleanup | sed "s/^/[$LABEL] cleanup: /"' EXIT
 
 say()   { echo "[$LABEL] $*"; }
 box()   { echo "[$LABEL] BOX $1: $2 [mode: ${MODE:-sandbox}] — $3" | tee -a "$OUT/boxes.txt"; [ "$2" = CHECKED ] || fail=1; }
@@ -75,16 +85,22 @@ launch() {
   setsid "${APP[@]}" --remote-debugging-port=9222 "$@" >"$OUT/$LABEL-$tag.log" 2>&1 &
   APP_PID=$!
   say "launched pid $APP_PID: ${APP[*]} --remote-debugging-port=9222 $*"
+  own_record "$APP_PID" || say "app pid $APP_PID is NOT recorded: it will not be signalled"
 }
 
 stop_app() {
   say "processes before stop:"; ps -eo pid,pgid,ppid,args | grep -iE 'rysh|appimage|electron' | grep -v grep | cut -c1-200 | sed "s/^/[$LABEL]   /"
-  kill -TERM -- "-$APP_PID" 2>/dev/null
-  for _ in $(seq 1 15); do pgrep -g "$APP_PID" >/dev/null || break; sleep 1; done
-  kill -KILL -- "-$APP_PID" 2>/dev/null
-  # the daemon is spawned detached and is meant to outlive the app; reap it so
-  # the next launch starts clean (this is the runner, not anyone's session)
-  pkill -f "rysh-linux-x64 daemon" 2>/dev/null
+  local f p s
+  # the app and its group (setsid): TERM, up to 15 s, then KILL; only while it is still ours
+  stop_own "$APP_PID" group 15 | sed "s/^/[$LABEL]   /"
+  # the daemon is spawned detached (its own group) and is meant to outlive the app; stop the
+  # ones THIS run's app recorded in its registry under the fresh HOME, each only if its
+  # executable is the bundled rysh-linux-x64, so the next launch starts clean
+  if f="$(registry_file "$HOME")"; then
+    while IFS="$(printf '\t')" read -r p s; do
+      daemon_record "$p" rysh-linux-x64 && stop_own "$p" group 10
+    done < <(registry_pids "$f") | sed "s/^/[$LABEL]   /"
+  fi
   sleep 2
   say "processes after stop:"; ps -eo pid,pgid,ppid,args | grep -iE 'rysh|appimage|electron' | grep -v grep | cut -c1-200 | sed "s/^/[$LABEL]   /"
 }
@@ -145,13 +161,9 @@ say "renderer (CDP):"; RT="$(renderer_text)"; echo "$RT" | sed "s/^/[$LABEL]   /
 say "created under \$HOME (depth 3):"; (cd "$HOME" && find . -maxdepth 3 2>/dev/null | sort) | sed "s/^/[$LABEL]   /" | tee "$OUT/$LABEL-box2-config-tree.txt"
 say "app log (first 40 non-extraction lines):"; grep -vh '^/tmp/appimage_extracted_' "$OUT/$LABEL-first"*.log | head -40 | sed "s/^/[$LABEL]   /"
 
-# A first launch must land on the empty screen. Anything else (e.g. a reopened
-# workspace) means the profile was not fresh, and the box is not proven.
-if [ "$alive" = 1 ] && echo "$RT" | grep -q 'No workspace loaded' && echo "$RT" | grep -q 'Open Workspace'; then
-  box 2 CHECKED "process alive and renderer shows the first-run screen: $(echo "$RT" | grep '^innerText' | cut -c1-200)"
-else
-  box 2 FAILED "alive=$alive; renderer: $(echo "$RT" | tr '\n' ' ' | cut -c1-300)"
-fi
+# The verdict lives in lib-t2-box2.sh (tested by scripts/verify/t2-box2.test.ts).
+B2="$(t2_box2_verdict "$alive" "$RT" "$HOME")"
+box 2 "${B2%% *}" "${B2#* }"
 
 stop_app
 # userData dir — found, not assumed. Run 1 showed nothing under $HOME/.config,
@@ -195,15 +207,20 @@ for _ in $(seq 1 60); do
 done
 say "app log, sidecar/main lines:"; grep -E '^\[(main|sidecar)' "$OUT/$LABEL-reopen.log" | head -30 | sed "s/^/[$LABEL]   /"
 
-DPID="$(pgrep -f "rysh-linux-x64 daemon $SESSION" | head -1)"
+# the daemon pid comes from the app's own record (written once the daemon is healthy), and
+# is used only if its executable is the bundled rysh-linux-x64
+DPID=""
+if [ -n "$started" ] && DPID="$(wait_registry_pid "$HOME" "$SESSION" 30 "$APP_PID")"; then
+  daemon_record "$DPID" rysh-linux-x64 | sed "s/^/[$LABEL]   /"; [ "${PIPESTATUS[0]}" = 0 ] || DPID=""
+else DPID=""; fi
 if [ -z "$started" ] || [ -z "$DPID" ]; then
   shot box3
-  box 3 FAILED "app did not start its daemon (reopened=${started:-no}, daemon pid=${DPID:-none})"
+  box 3 FAILED "app did not start its daemon (reopened=${started:-no}, recorded daemon pid=${DPID:-none})"
   tail -40 "$OUT/$LABEL-reopen.log" | sed "s/^/[$LABEL]   /"
   stop_app; exit $fail
 fi
 SIDE="$(readlink -f "/proc/$DPID/exe")"
-say "daemon pid $DPID, exe $SIDE (spawned by the app)"
+say "daemon pid $DPID, exe $SIDE (spawned by the app; pid from its registry)"
 say "daemon cmdline: $(tr '\0' ' ' </proc/"$DPID"/cmdline)"
 PORT="$(grep -oE 'web port: [0-9]+' "$OUT/$LABEL-reopen.log" | head -1 | grep -oE '[0-9]+')"
 say "health: $(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health") on :$PORT"

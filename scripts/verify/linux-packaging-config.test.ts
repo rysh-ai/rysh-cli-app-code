@@ -51,6 +51,22 @@ describe('electron-builder.yml', () => {
     expect(existsSync(join(ROOT, config.afterPack))).toBe(true)
   })
 
+  it('deb.depends keeps electron-builder 25.1.8 defaults and adds libgbm1 + libasound2 (H-33)', () => {
+    // H-33 dev-host runs 2/3 (2026-11-01): on a minimal ubuntu:22.04, `apt-get install
+    // ./rysh-desktop.deb` succeeded and the app died on `libgbm.so.1: cannot open shared
+    // object file`; the built .deb declared neither libgbm1 nor libasound2. Setting `depends`
+    // REPLACES electron-builder's default list (its app-builder binary, 25.1.8), so the
+    // defaults must stay listed too.
+    const defaults = ['libgtk-3-0', 'libnotify4', 'libnss3', 'libxss1', 'libxtst6', 'xdg-utils',
+      'libatspi2.0-0', 'libuuid1', 'libsecret-1-0']
+    const depends = config.deb.depends as string[]
+    expect(Array.isArray(depends)).toBe(true)
+    for (const d of defaults) expect(depends).toContain(d)
+    expect(depends).toContain('libgbm1')
+    // Ubuntu 24.04 renamed it in the t64 transition; either satisfies the dependency.
+    expect(depends).toContain('libasound2 | libasound2t64')
+  })
+
   it('the AppArmor profile is bundled with the Linux app', () => {
     expect(config.linux.extraResources).toContainEqual({ from: 'resources/linux/apparmor-profile', to: 'apparmor-profile' })
   })

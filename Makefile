@@ -28,17 +28,17 @@ HOST_ARCH := $(shell \
 	if [ "$$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" ]; then echo arm64; \
 	else uname -m | sed -e 's/^x86_64$$/amd64/' -e 's/^aarch64$$/arm64/'; fi)
 
-# Absolute project root. start/stop/status match processes by this path so they
-# only ever touch THIS app — its dev server, Electron, and the daemons it
-# spawned — never the user's own `rysh`/`ry` CLI sessions.
+# Absolute project root.
 APP_ROOT := $(abspath .)
 
-# Process-match patterns. The first letter is bracketed (e.g. [r]ysh) so the
-# pgrep/pkill command never matches ITS OWN command line — a classic footgun.
-DEV_MATCH         := [e]lectron-vite dev
-ELECTRON_UI_MATCH := $(APP_ROOT)/node_modules/electron/dist/Electron.app/Contents/MacOS/[E]lectron
-ELECTRON_ALL_MATCH:= $(APP_ROOT)/node_modules/[e]lectron/dist/Electron.app
-SIDECAR_MATCH     := $(APP_ROOT)/$(SIDECAR_DIR)/[r]ysh-
+# start/dev/stop/restart/status go through scripts/local-run.sh (E12 order 30a,
+# rr-msg-293). It starts, stops and reports ONLY what it recorded — the dev app's
+# own process group (or pid) in .run/ (gitignored), and the sidecar daemons the
+# app recorded in its registry plus their session records — each after an
+# identity check (alive; exactly the recorded command, or this checkout's own
+# sidecar path). There is no pattern kill or pattern lookup anywhere: the old
+# pkill/pgrep -f matched by text and could hit other agents' processes.
+LOCAL_RUN := ./scripts/local-run.sh
 
 # Background dev-app log (see `make start` / `make logs`).
 DEV_LOG := /tmp/rysh-app-dev.log
@@ -74,7 +74,7 @@ install:
 	npm install
 
 dev: build-sidecar-local
-	npm run dev
+	@DEV_LOG=$(DEV_LOG) $(LOCAL_RUN) dev
 
 # ── Run / lifecycle (dev app) ──
 
@@ -84,25 +84,19 @@ dev: build-sidecar-local
 # them with `make logs`; shut it down with `make stop`.
 #
 # Detachment details: `</dev/null` frees stdin (electron-vite's dev server grabs
-# the terminal for its interactive shortcuts otherwise — the usual cause of a
-# "backgrounded but still attached/hanging" launch); `nohup` ignores SIGHUP so a
-# closing terminal can't kill it; and `( … & )` orphans it to launchd right away
-# so `make` never tracks or waits on it. For an attached/foreground run that you
-# can Ctrl+C, use `make dev` instead.
+# the terminal for its interactive shortcuts otherwise); the app runs in its OWN
+# process group (job control), so a closing terminal does not signal it and
+# `make stop` can stop exactly that group; its id is recorded in .run/dev.pgid.
+# For an attached/foreground run that you can Ctrl+C, use `make dev` instead.
 start: build-sidecar-local
-	@if pgrep -f "$(ELECTRON_UI_MATCH)" >/dev/null 2>&1; then \
-		echo "rysh app is already running — use 'make restart' to relaunch."; \
-	else \
-		echo "Starting rysh app, detached (logs: $(DEV_LOG))..."; \
-		( nohup npm run dev </dev/null > $(DEV_LOG) 2>&1 & ); \
-		echo "Started independently of this shell. Follow logs: make logs   ·   Stop: make stop"; \
-	fi
+	@DEV_LOG=$(DEV_LOG) $(LOCAL_RUN) start
 
-# Stop everything this app started: the electron-vite dev server, the app's
-# Electron processes (main + helpers), and the sidecar daemons it spawned —
-# matched by this app's path, so the user's own CLI rysh sessions are untouched.
-# Note: this also stops daemons the app's Detach feature left running (it is a
-# full dev teardown).
+# Stop everything this app started and RECORDED: the dev app's process group (the
+# electron-vite dev server and the app's Electron processes), and the sidecar
+# daemons the app recorded in its registry (incl. those its Detach feature left
+# running) — each only after the identity check, so nothing that merely matches
+# a text pattern is touched, and the user's own CLI rysh sessions never are.
+# A daemon the app never recorded is not stopped here.
 #
 # THE DAEMON GETS SIGTERM, NOT SIGKILL, and the difference is not politeness —
 # it is whether the session survives the restart. A pane's given name and its
@@ -122,19 +116,7 @@ start: build-sidecar-local
 # fallback, not the first move.
 stop:
 	@./scripts/guard-live-session.sh
-	@echo "Stopping rysh app..."
-	@pkill -f "$(DEV_MATCH)" 2>/dev/null || true
-	@pkill -f "$(ELECTRON_ALL_MATCH)" 2>/dev/null || true
-	@pkill -f "$(SIDECAR_MATCH)" 2>/dev/null || true
-	@for i in 1 2 3 4 5 6 7 8 9 10; do \
-		pgrep -f "$(SIDECAR_MATCH)" >/dev/null 2>&1 || break; \
-		sleep 1; \
-	done
-	@if pgrep -f "$(SIDECAR_MATCH)" >/dev/null 2>&1; then \
-		echo "  daemon ignored SIGTERM after 10s — escalating to SIGKILL (pane names/agent metadata since the last KV flush will be lost)"; \
-		pkill -9 -f "$(SIDECAR_MATCH)" 2>/dev/null || true; \
-	fi
-	@echo "Stopped."
+	@$(LOCAL_RUN) stop
 
 # Stop, then start again.
 restart:
@@ -142,11 +124,9 @@ restart:
 	@sleep 2
 	@$(MAKE) start
 
-# Report what's currently running.
+# Report what's currently running (from the records only; no process-pattern lookup).
 status:
-	@pgrep -f "$(DEV_MATCH)"         >/dev/null 2>&1 && echo "dev server : running" || echo "dev server : stopped"
-	@pgrep -f "$(ELECTRON_UI_MATCH)" >/dev/null 2>&1 && echo "app UI     : running" || echo "app UI     : stopped"
-	@printf "daemons    : %s running\n" "$$(pgrep -f "$(SIDECAR_MATCH)" 2>/dev/null | wc -l | tr -d ' ')"
+	@$(LOCAL_RUN) status
 
 # Follow the background app log.
 logs:

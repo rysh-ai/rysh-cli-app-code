@@ -133,6 +133,24 @@ linux:
 deb:
   packageName: rysh-desktop
   artifactName: rysh-desktop_${version}_${arch}.deb
+  # H-33 (2026-11-01): electron-builder 25.1.8's default Depends has neither libgbm1 nor
+  # libasound2, so on a minimal Ubuntu the .deb installed and the app died on
+  # `libgbm.so.1: cannot open shared object file`. Setting `depends` REPLACES the
+  # default list, so its nine entries are kept first. libasound2 was renamed
+  # libasound2t64 in Ubuntu 24.04; either satisfies it.
+  # Pinned by scripts/verify/linux-packaging-config.test.ts.
+  depends:
+    - libgtk-3-0
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - xdg-utils
+    - libatspi2.0-0
+    - libuuid1
+    - libsecret-1-0
+    - libgbm1
+    - libasound2 | libasound2t64
   # E-92: the default postinst leaves chrome-sandbox 0755 on Ubuntu 24.04 (its
   # userns probe runs as root, which AppArmor does not restrict), so the app
   # aborts for every user. These replace electron-builder's templates — see the
