@@ -21,7 +21,7 @@ import {
   spawnNewInstance,
   focusSiblingInstance,
 } from './instanceManager'
-import { connectLinksInArgv, parseConnectLink, runConnect } from './companyConnect'
+import { checkConnectResult, confirmConnectServer, connectLinksInArgv, parseConnectLink, runConnect } from './companyConnect'
 import { defaultWorkspacePath, ensureDefaultWorkspace, planBoot } from './defaultWorkspace'
 
 let mainWindow: BrowserWindow | null = null
@@ -95,9 +95,24 @@ async function handleConnectLink(link: string): Promise<{ success: boolean; erro
     if (mainWindow.isMinimized()) mainWindow.restore()
     mainWindow.focus()
   }
+  // ledger 157: any page can craft a link; a server other than rysh.ai/letchat.ai needs the user's yes.
+  const refused = await confirmConnectServer(target, async (message, detail) => {
+    const opts = { type: 'warning' as const, buttons: ['Cancel', 'Connect'], defaultId: 0, cancelId: 0, message, detail }
+    const { response } = mainWindow ? await dialog.showMessageBox(mainWindow, opts) : await dialog.showMessageBox(opts)
+    return response === 1
+  })
+  if (refused) {
+    sendConnectStatus('error', refused)
+    return { success: false, error: refused }
+  }
   sendConnectStatus('claiming', `Connecting to ${target.server}…`)
   try {
     const result = await runConnect(resolveSidecarBinaryPath(), target)
+    const unsafe = checkConnectResult(result, target)
+    if (unsafe) {
+      sendConnectStatus('error', unsafe)
+      return { success: false, error: unsafe }
+    }
     sendConnectStatus('opening', `Opening ${result.company.name}…`)
     const opened = await openWorkspace(result.directory, result.session)
     if (!opened.success) {
@@ -811,7 +826,7 @@ app.whenReady().then(async () => {
 
   // Set up auto-updater (production only)
   if (!is.dev) {
-    autoUpdateManager = new AutoUpdateManager(mainWindow)
+    autoUpdateManager = new AutoUpdateManager(mainWindow, app.getPath('logs'))
     autoUpdateManager.checkForUpdates()
   }
 
