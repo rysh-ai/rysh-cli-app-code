@@ -22,13 +22,26 @@ export function WelcomeScreen() {
   const [connectStatus, setConnectStatus] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   useEffect(() => {
-    const api = window.electronAPI?.company;
-    api?.onStatus((s) => {
+    const off = window.electronAPI?.company?.onStatus((s) => {
       setConnectStatus(s.message);
       if (s.stage === 'done' || s.stage === 'error') setConnecting(false);
     });
-    return () => api?.removeStatusListener();
+    return () => {
+      if (typeof off === 'function') off();
+    };
   }, []);
+  // S2.3: a .ryshconnect file from the company page; main shows the dialog and reads it.
+  async function chooseConnectFile() {
+    if (connecting) return;
+    setConnecting(true);
+    try {
+      const res = await window.electronAPI?.company.openFile();
+      if (res && !res.success && res.error) setConnectStatus(res.error);
+    } finally {
+      setConnecting(false);
+    }
+  }
+
   async function connectCompany() {
     if (connecting || !connectText.trim()) return;
     setConnecting(true);
@@ -106,6 +119,19 @@ export function WelcomeScreen() {
                 className="px-3 py-1.5 rounded bg-[#0e639c] hover:bg-[#1177bb] text-white text-[12px] font-medium cursor-pointer disabled:opacity-50"
               >
                 {connecting ? 'Connecting…' : 'Connect'}
+              </button>
+            </div>
+            <div className="mt-2 flex items-center gap-2 text-[12px] text-[#8a8a8a]">
+              <span>
+                Downloaded a <span className="font-mono text-[#aaa]">.ryshconnect</span> file? On its first start
+                Rysh picks up one from the last 30 minutes; otherwise use
+              </span>
+              <button
+                onClick={() => void chooseConnectFile()}
+                disabled={connecting}
+                className="text-[#4fc1ff] hover:underline cursor-pointer disabled:opacity-50"
+              >
+                Choose connect file…
               </button>
             </div>
             {connectStatus && <div className="mt-2 text-[12px] text-[#aaa]">{connectStatus}</div>}

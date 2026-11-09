@@ -50,7 +50,7 @@
 # GUARD_SYSTEM_UTILS: every system tool this script calls (bare, or by the absolute
 # path noted), by name. The static test (scripts/local/test-static-tools.sh) checks it.
 # Reason (one, shared): POSIX text/file utilities: no network, no process control, act only on paths the script names
-# (lsof is used only as /usr/sbin/lsof -a -p <pid> ... of a known pid; it reads, never signals.)
+# (lsof is used only as /usr/sbin/lsof [-a] -p <pid> ... of a known pid, on macOS; it reads, never signals.)
 GUARD_SYSTEM_UTILS=(awk basename cat dirname grep head lsof readlink sed)
 # GUARD_REAL_TOOLS: the one real tool outside that list, with its reason (as APP_REAL_TOOLS).
 GUARD_REAL_TOOLS=(uname)
@@ -79,6 +79,23 @@ fi
 exe_of() {
   if [ "$OS_NAME" = Darwin ]; then /usr/sbin/lsof -a -p "$1" -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
   else readlink "/proc/$1/exe" 2>/dev/null; fi
+}
+
+# pane_count_of <pid>: the character-device descriptors of a known pid (a pty master per pane); empty when they
+# cannot be read. macOS: the CHR lines of /usr/sbin/lsof -p <pid>. Elsewhere: the /proc/<pid>/fd links that name a
+# character device (/dev/ptmx, /dev/pts/N, /dev/null, ...), the same set; Linux has no /usr/sbin/lsof. Nothing
+# (refuse) when no link could be read (security-lead P1).
+pane_count_of() {
+  if [ "$OS_NAME" = Darwin ]; then
+    local fds; fds="$(/usr/sbin/lsof -p "$1" 2>/dev/null)"
+    [ -n "$fds" ] && printf '%s\n' "$fds" | grep -c CHR
+  else
+    local d="/proc/$1/fd" f t n=0 r=0
+    { [ -r "$d" ] && [ -x "$d" ]; } || return 0
+    for f in "$d"/*; do t="$(readlink "$f" 2>/dev/null)" || continue; r=$((r+1)); [ -c "$t" ] && n=$((n+1)); done
+    # no link read (exit race, restricted links): unreadable, not 0 -- a live daemon always holds a char device
+    [ "$r" -gt 0 ] && echo "$n"
+  fi
 }
 
 # candidates: "pid<TAB>session" from the registry and each recorded daemon's session record
@@ -117,12 +134,11 @@ while IFS=$'\t' read -r pid session; do
   # whether or not an agent is running in it. Read from the OS rather than by
   # asking the daemon, because the guard has to work on a daemon that is wedged —
   # which is the case where someone is most likely to reach for `make stop`.
-  fds="$(/usr/sbin/lsof -p "$pid" 2>/dev/null)"
-  if [ -z "$fds" ]; then                                       # ours, pane count unreadable: refuse
+  panes="$(pane_count_of "$pid")"
+  if [ -z "$panes" ]; then                                     # ours, pane count unreadable: refuse
     busy="${busy}    pid ${pid}  session ${session:-?}  pane count unreadable (refusing)"$'\n'
     continue
   fi
-  panes=$(printf '%s\n' "$fds" | grep -c CHR)
   [ "$panes" -le "$LIVE_PANE_LIMIT" ] && continue
   busy="${busy}    pid ${pid}  session ${session:-?}  ${panes} panes"$'\n'
 done < <(candidates)

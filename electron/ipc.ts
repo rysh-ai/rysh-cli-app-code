@@ -17,6 +17,8 @@ export interface WorkspaceCallbacks {
   onDetachSession: () => { success: boolean; error?: string }
   /** Company Connect (design 037): claim a code (deep link or pasted line) and open its workspace. */
   onConnectCompany?: (link: string) => Promise<{ success: boolean; error?: string }>
+  /** S2.3: choose a .ryshconnect file in main's dialog, then claim it like a link. */
+  onConnectCompanyFile?: () => Promise<{ success: boolean; error?: string }>
 }
 
 /**
@@ -75,6 +77,12 @@ export function registerIpcHandlers(
   ipcMain.handle('connect-company', async (_event, link: string) => {
     if (!workspaceCallbacks?.onConnectCompany) return { success: false, error: 'Company connect is not available' }
     return workspaceCallbacks.onConnectCompany(String(link || ''))
+  })
+
+  // S2.3: no argument from the renderer; main shows the dialog and reads the file.
+  ipcMain.handle('connect-company-file', async () => {
+    if (!workspaceCallbacks?.onConnectCompanyFile) return { success: false, error: 'Company connect is not available' }
+    return workspaceCallbacks.onConnectCompanyFile()
   })
 
   // Reload only the app UI (renderer); the daemon keeps running on the same port.

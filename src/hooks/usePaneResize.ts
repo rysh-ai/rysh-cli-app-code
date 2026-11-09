@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef } from 'react';
 import { sendCommand } from '../utils/commands';
 import { useStore } from '../store';
 import { measureVTCell } from '../utils/cellMetrics';
+import { pickMobileUI } from '../utils/pickMobileUI';
 
 /**
  * usePaneResize keeps a pane's PTY + virtual terminal sized to the actual
@@ -16,6 +17,12 @@ import { measureVTCell } from '../utils/cellMetrics';
  * therefore end up rendering a grid smaller than its pane, with space around
  * it; that is the correct outcome, since the alternative is a smaller viewport
  * having to truncate a full-screen app's display.
+ *
+ * The phone UI is the exception: its claim is PASSIVE, which the daemon only
+ * honours when no other viewport is showing the pane. A phone joining over a
+ * web tunnel would otherwise shrink the pane on the desktop to ~45 columns the
+ * moment it connected; instead the phone pans the desktop-sized grid (see the
+ * touch handler in PaneBox), and still sizes the pane when it is alone on it.
  *
  * Returns a callback ref to attach to the pane's content container. The callback
  * ref (rather than a useEffect) is deliberate: a stacked pane's content node
@@ -33,6 +40,20 @@ const measureCell = measureVTCell;
 const PAD_X = 8; // 4px left + 4px right
 const PAD_Y = 4; // 2px top + 2px bottom
 const DEBOUNCE_MS = 80; // coalesce a window-drag burst into one resize
+
+// Which UI mounted is decided once at startup (main.tsx) and never changes, so
+// it is read lazily once rather than per claim.
+let passiveClaim: boolean | null = null;
+function isPassive(): boolean {
+  if (passiveClaim === null) passiveClaim = pickMobileUI();
+  return passiveClaim;
+}
+
+function claimSize(paneId: string, rows: number, cols: number) {
+  const params: Record<string, unknown> = { pane_id: paneId, rows, cols };
+  if (isPassive()) params.passive = true;
+  sendCommand('pane_resize', params);
+}
 
 export function usePaneResize(paneId: string): (el: HTMLElement | null) => void {
   // Per-pane observer/timer/last-sent state, persisted across attach cycles so a
@@ -64,7 +85,7 @@ export function usePaneResize(paneId: string): (el: HTMLElement | null) => void 
     const { w, h } = measureCell();
     s.cols = Math.max(1, Math.floor((rect.width - PAD_X) / w));
     s.rows = Math.max(1, Math.floor((rect.height - PAD_Y) / h));
-    sendCommand('pane_resize', { pane_id: paneId, rows: s.rows, cols: s.cols });
+    claimSize(paneId, s.rows, s.cols);
   }, [wsEpoch, paneId]);
 
   return useCallback(
@@ -93,7 +114,7 @@ export function usePaneResize(paneId: string): (el: HTMLElement | null) => void 
         if (rows === s.rows && cols === s.cols) return;
         s.rows = rows;
         s.cols = cols;
-        sendCommand('pane_resize', { pane_id: paneId, rows, cols });
+        claimSize(paneId, rows, cols);
       };
 
       const ro = new ResizeObserver(() => {

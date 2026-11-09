@@ -93,9 +93,12 @@ export async function confirmConnectServer(
   return yes ? null : `Cancelled: not connecting to ${c.host}.`
 }
 
-/** connectArgs is the sidecar's argv: the server and the one-time code, nothing stored. */
+/**
+ * connectArgs is the sidecar's argv: the server and the one-time code, nothing stored. The claim is
+ * recorded as the desktop app (`--vehicle desktop`; the sidecar is pinned with the app, so it has the flag).
+ */
 export function connectArgs(target: ConnectTarget, device: string): string[] {
-  return ['connect', target.server, target.token, '--json', '--device', device]
+  return ['connect', target.server, target.token, '--json', '--device', device, '--vehicle', 'desktop']
 }
 
 /**

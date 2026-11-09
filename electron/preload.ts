@@ -70,7 +70,9 @@ export interface ElectronAPI {
   company: {
     /** A rysh://connect link, or a pasted `ry connect …` / install line. */
     connect: (link: string) => Promise<{ success: boolean; error?: string }>
-    onStatus: (callback: (status: { stage: 'claiming' | 'opening' | 'done' | 'error'; message: string }) => void) => void
+    /** S2.3: choose a .ryshconnect file in main's dialog and claim it. */
+    openFile: () => Promise<{ success: boolean; error?: string }>
+    onStatus: (callback: (status: { stage: 'claiming' | 'opening' | 'done' | 'error'; message: string }) => void) => () => void
     removeStatusListener: () => void
   }
 
@@ -150,8 +152,13 @@ const api: ElectronAPI = {
 
   company: {
     connect: (link) => ipcRenderer.invoke('connect-company', link),
+    openFile: () => ipcRenderer.invoke('connect-company-file'),
+    // Returns its own unsubscribe (N2): two views listen (welcome screen + the toast over a workspace),
+    // so neither may remove the other's listener.
     onStatus: (callback) => {
-      ipcRenderer.on('company-connect-status', (_event, status) => callback(status))
+      const handler = (_event: unknown, status: Parameters<typeof callback>[0]) => callback(status)
+      ipcRenderer.on('company-connect-status', handler)
+      return () => ipcRenderer.removeListener('company-connect-status', handler)
     },
     removeStatusListener: () => {
       ipcRenderer.removeAllListeners('company-connect-status')

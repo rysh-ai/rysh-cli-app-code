@@ -1,6 +1,7 @@
 import { BrowserWindow, dialog } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import { createUpdateLog, type UpdateLog } from './updateLog'
+import { updateLocation, type UpdateLocation } from './updateLocation'
 
 /**
  * AutoUpdateManager handles checking for updates, downloading them,
@@ -14,15 +15,21 @@ export class AutoUpdateManager {
   private window: BrowserWindow
   private checkInterval: ReturnType<typeof setInterval> | null = null
   private log: UpdateLog
+  /** L8: where this copy runs from decides whether an update can be applied at all. */
+  private location: UpdateLocation
+  private explained = false
 
   constructor(window: BrowserWindow, logDir: string) {
     this.window = window
     this.log = createUpdateLog(logDir)
     autoUpdater.logger = this.log
 
-    // Configure auto-updater
-    autoUpdater.autoDownload = true
-    autoUpdater.autoInstallOnAppQuit = true
+    this.location = updateLocation(process.execPath, process.platform)
+    if (this.location.kind !== 'ok') this.log.info(`[autoUpdate] location: ${this.location.kind}`)
+
+    // Configure auto-updater. A copy that cannot replace itself never downloads (L8).
+    autoUpdater.autoDownload = this.location.kind !== 'cannot-update'
+    autoUpdater.autoInstallOnAppQuit = this.location.kind !== 'cannot-update'
 
     // Set up event handlers
     autoUpdater.on('checking-for-update', () => {
@@ -33,6 +40,7 @@ export class AutoUpdateManager {
     autoUpdater.on('update-available', (info) => {
       console.log(`[autoUpdate] Update available: v${info.version}`)
       this.log.info(`[autoUpdate] Update available: v${info.version}`)
+      if (this.location.kind === 'cannot-update') void this.explainCannotUpdate(info.version)
     })
 
     autoUpdater.on('update-not-available', () => {
@@ -92,11 +100,17 @@ export class AutoUpdateManager {
    * Show a dialog prompting the user to restart to apply the update.
    */
   private async promptRestart(version: string): Promise<void> {
+    // L8 / R8b finding 1: say before the click that macOS will ask for an administrator.
+    const detail =
+      this.location.kind === 'needs-admin'
+        ? `Restart now to apply the update? macOS will ask for an administrator's name and password, ` +
+          `because this account cannot change ${this.location.folder}.`
+        : 'Restart now to apply the update?'
     const result = await dialog.showMessageBox(this.window, {
       type: 'info',
       title: 'Update Available',
       message: `Rysh v${version} has been downloaded.`,
-      detail: 'Restart now to apply the update?',
+      detail,
       buttons: ['Restart Now', 'Later'],
       defaultId: 0,
       cancelId: 1,
@@ -105,5 +119,23 @@ export class AutoUpdateManager {
     if (result.response === 0) {
       autoUpdater.quitAndInstall()
     }
+  }
+
+  /**
+   * L8: an update exists but this copy cannot replace itself (translocated, or
+   * run from the disk image). Say so once per run instead of a Restart Now that
+   * cannot work.
+   */
+  private async explainCannotUpdate(version: string): Promise<void> {
+    if (this.explained || this.location.kind !== 'cannot-update') return
+    this.explained = true
+    await dialog.showMessageBox(this.window, {
+      type: 'info',
+      title: 'Update Available',
+      message: `Rysh v${version} is available, but this copy cannot update itself where it runs now.`,
+      detail: this.location.advice,
+      buttons: ['OK'],
+      defaultId: 0,
+    })
   }
 }

@@ -571,25 +571,46 @@ export const PaneBox = React.memo(function PaneBox({
   // direction: content follows the finger. Native (non-passive) listeners
   // because React's root touch listeners are passive and iOS needs
   // preventDefault to suppress rubber-banding.
+  //
+  // A mostly-horizontal drag pans the screen instead. The phone's size claim is
+  // passive (usePaneResize), so a pane a desktop window is also showing keeps
+  // the desktop's width and is wider than the phone; panning is how the rest of
+  // it is reached. The axis is locked per gesture so a pan never scrolls the
+  // program and vice versa.
   const touchScrollElRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
     const el = touchScrollElRef.current;
     if (!el || !showTouchInput) return;
+    let lastX = 0;
     let lastY = 0;
     let travelled = 0;
+    let axis: 'x' | 'y' | null = null;
     const onStart = (e: TouchEvent) => {
       if (e.touches.length !== 1) return;
+      lastX = e.touches[0].clientX;
       lastY = e.touches[0].clientY;
       travelled = 0;
+      axis = null;
     };
     const onMove = (e: TouchEvent) => {
       if (e.touches.length !== 1) return;
       const t = e.touches[0];
+      const dx = t.clientX - lastX;
       const dy = t.clientY - lastY;
+      lastX = t.clientX;
       lastY = t.clientY;
-      travelled += Math.abs(dy);
+      travelled += Math.abs(dx) + Math.abs(dy);
       if (travelled > 12) touchDraggedRef.current = true;
       e.preventDefault();
+      if (axis === null) {
+        if (Math.abs(dx) === Math.abs(dy)) return; // no direction yet
+        axis = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y';
+      }
+      if (axis === 'x') {
+        const vt = el.querySelector('.vt-screen') as HTMLElement | null;
+        if (vt) vt.scrollLeft -= dx;
+        return;
+      }
       forwardVTScroll(el, -dy, t.clientX, t.clientY);
     };
     const onEnd = () => {

@@ -13,6 +13,11 @@ const lastWebProfile = new Map<string, string>();
 // "show & rebind the browser now" signal — it switches the pane back to web even
 // when the binding is unchanged and the pane was showing another display mode.
 const lastWebActivateSeq = new Map<string, number>();
+// N1 (CD3 rehearsal): panes whose daemon-preferred mode was applied this window session, and panes whose
+// mode the user picked (setInputMode; the web_activate/deactivate pushes count too: a newer explicit display
+// push beats an older preference); a preference is applied once, and never over a pick.
+const appliedPreferredMode = new Set<string>();
+const userPickedMode = new Set<string>();
 
 // Web display is push-driven: the backend sends `web_activate` / `web_deactivate`
 // pushes (see useWebSocket.ts) that flip a pane's display on/off web immediately,
@@ -241,6 +246,63 @@ function closedPaneIds(s: WorkspaceSnapshot, known: string[]): { panes: Set<stri
 
 // seedContent extracts per-pane content + VT from a full snapshot (used to seed
 // the stores on connect / on any full snapshot).
+/**
+ * carryStalePanes returns `next` with every stale pane (`stale: true`) replaced
+ * by that pane as `prev` had it. Mirrors rysh-cli internal/tui/snapshot_stale.go.
+ *
+ * A stale pane missed the daemon's snapshot deadline — under load, e.g. dozens
+ * of claude panes in one session — so its entry is a past answer or a
+ * zero-valued placeholder. Taken at face value the placeholder's missing
+ * raw_mode flipped a running claude pane to its shell view until the next
+ * on-time snapshot. A group whose panes are ALL stale (the whole group timed
+ * out) is carried as a set so stacked siblings do not vanish for a frame.
+ */
+export function carryStalePanes(prev: WorkspaceSnapshot | null, next: WorkspaceSnapshot): WorkspaceSnapshot {
+  const anyStale = (next.tabs || []).some((t) =>
+    (t.lanes || []).some((l) => (l.pane_groups || []).some((g) => (g.panes || []).some((p) => p.stale))));
+  if (!anyStale || !prev) return next;
+  const prevPanes = new Map<string, PaneSnapshot>();
+  const prevGroups = new Map<string, PaneSnapshot[]>();
+  for (const t of prev.tabs || []) {
+    for (const l of t.lanes || []) {
+      for (const g of l.pane_groups || []) {
+        prevGroups.set(g.id, g.panes || []);
+        for (const p of g.panes || []) prevPanes.set(p.id, p);
+      }
+    }
+  }
+  return {
+    ...next,
+    tabs: (next.tabs || []).map((t) => ({
+      ...t,
+      lanes: (t.lanes || []).map((l) => ({
+        ...l,
+        pane_groups: (l.pane_groups || []).map((g) => {
+          const panes = g.panes || [];
+          const old = prevGroups.get(g.id);
+          if (panes.length > 0 && panes.every((p) => p.stale) && old && old.length > 0) {
+            return { ...g, panes: [...old] };
+          }
+          return { ...g, panes: panes.map((p) => (p.stale ? prevPanes.get(p.id) ?? p : p)) };
+        }),
+      })),
+    })),
+  };
+}
+
+/** stalePaneIds lists the panes of `s` marked stale. */
+function stalePaneIds(s: WorkspaceSnapshot): string[] {
+  const out: string[] = [];
+  for (const t of s.tabs || []) {
+    for (const l of t.lanes || []) {
+      for (const g of l.pane_groups || []) {
+        for (const p of g.panes || []) if (p.stale) out.push(p.id);
+      }
+    }
+  }
+  return out;
+}
+
 function seedContent(s: WorkspaceSnapshot): { content: Record<string, PaneContentBuf>; vt: Record<string, PaneVTBuf> } {
   const content: Record<string, PaneContentBuf> = {};
   const vt: Record<string, PaneVTBuf> = {};
@@ -627,8 +689,11 @@ export const useStore = create<AppStore>((set, get) => ({
   workspaceName: null,
 
   // Actions
-  setSnapshot: (s, layoutOnly) => {
-    const { focusedPaneID, followDaemonUntil, paneEcho, paneContent: prevContent, paneVT: prevVT, paneInputModes } = get();
+  setSnapshot: (incoming, layoutOnly) => {
+    const { focusedPaneID, followDaemonUntil, paneEcho, paneContent: prevContent, paneVT: prevVT, paneInputModes, snapshot: prevSnapshot } = get();
+    // A pane that missed the daemon's deadline keeps the state it had here.
+    const s = carryStalePanes(prevSnapshot, incoming);
+    const staleIds = stalePaneIds(incoming);
     // A full snapshot (re)seeds the per-pane content/VT store; a layout-only one
     // keeps it (content arrives via pane_output / pane_vt deltas).
     let paneContent = prevContent;
@@ -637,6 +702,13 @@ export const useStore = create<AppStore>((set, get) => ({
       const seeded = seedContent(s);
       paneContent = seeded.content;
       paneVT = seeded.vt;
+      // A stale pane — carried or not — contributes no reading: keep what the
+      // content plane last delivered rather than its stripped/placeholder
+      // buffers and missing raw_mode (the claude→shell flip on a full seed).
+      for (const id of staleIds) {
+        if (prevContent[id]) paneContent[id] = prevContent[id];
+        if (prevVT[id]) paneVT[id] = prevVT[id];
+      }
     }
     // Reconcile predictive echoes against the fresh snapshot: drop an echo once
     // the authoritative cursor has advanced to/past where it ends (the source
@@ -701,6 +773,14 @@ export const useStore = create<AppStore>((set, get) => ({
             }
             lastWebProfile.set(id, profile);
             lastWebActivateSeq.set(id, seq);
+
+            // N1: open on the daemon-preferred mode once, if it is enabled and the user has not picked one.
+            const pref = p.preferred_mode || '';
+            if (pref && !appliedPreferredMode.has(id) && !userPickedMode.has(id) && enabledModes.includes(pref)) {
+              ensureClone();
+              nextModes[id] = pref as InputMode;
+              appliedPreferredMode.add(id);
+            }
 
             // Clamp a selected mode back to shell if it was disabled (##mode
             // delete) and the pane is no longer showing it.
@@ -836,13 +916,15 @@ export const useStore = create<AppStore>((set, get) => ({
       return {}; // only shell enabled — no change
     }),
 
-  setInputMode: (paneId, mode) =>
+  setInputMode: (paneId, mode) => {
+    userPickedMode.add(paneId);
     set((state) => ({
       paneInputModes: {
         ...state.paneInputModes,
         [paneId]: mode,
       },
-    })),
+    }));
+  },
 
   getInputMode: (paneId) => get().paneInputModes[paneId] || 'shell',
 

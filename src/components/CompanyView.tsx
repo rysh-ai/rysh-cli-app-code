@@ -2,18 +2,20 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useStore } from '../store';
 import { sendCommand } from '../utils/commands';
 import type { CompanySnapshot, CompanyActivity } from '../types';
+import { CompanyBooksTab } from './CompanyBooksTab';
 
 interface Props {
   paneId: string;
 }
 
-type Section = 'orders' | 'enquiries' | 'email' | 'phone' | 'services' | 'activity';
+type Section = 'orders' | 'enquiries' | 'email' | 'phone' | 'services' | 'books' | 'activity';
 const SECTIONS: Array<{ key: Section; label: string }> = [
   { key: 'orders', label: 'Orders' },
   { key: 'enquiries', label: 'Enquiries' },
   { key: 'email', label: 'Email' },
   { key: 'phone', label: 'Phone' },
   { key: 'services', label: 'Services' },
+  { key: 'books', label: 'Books' },
   { key: 'activity', label: 'Activity' },
 ];
 
@@ -29,7 +31,7 @@ export const CompanyView = React.memo(function CompanyView({ paneId }: Props) {
   const snap = useStore((s) => s.companySnapshot);
   const [section, setSection] = useState<Section>('orders');
   const [selected, setSelected] = useState<Record<Section, number>>({
-    orders: 0, enquiries: 0, email: 0, phone: 0, services: 0, activity: 0,
+    orders: 0, enquiries: 0, email: 0, phone: 0, services: 0, books: 0, activity: 0,
   });
   const [detailOpen, setDetailOpen] = useState(false);
 
@@ -68,6 +70,8 @@ export const CompanyView = React.memo(function CompanyView({ paneId }: Props) {
         <div className="flex-1 flex items-center justify-center text-[#8a8a8a]">
           waiting for the company follower…
         </div>
+      ) : section === 'books' ? (
+        <CompanyBooksTab books={snap.books} />
       ) : (
         <div className="flex-1 min-h-0 flex">
           <ul className={`min-h-0 overflow-y-auto ${detailOpen && current ? 'w-2/5 border-r border-[#2a2a2a]' : 'flex-1'}`}>
@@ -99,6 +103,7 @@ export const CompanyView = React.memo(function CompanyView({ paneId }: Props) {
 
 function Header({ snap, onRefresh }: { snap: CompanySnapshot | null; onRefresh: () => void }) {
   const c = snap?.company;
+  const grants = snap ? describeGrants(snap) : null;
   const link = snap ? describeLink(snap) : 'no snapshot yet';
   const warn = !!snap && (snap.link.auth_failed || (!snap.link.connected && !!snap.link.last_error));
   return (
@@ -115,12 +120,37 @@ function Header({ snap, onRefresh }: { snap: CompanySnapshot | null; onRefresh: 
             ? ` · updated ${new Date(snap.link.last_fetch).toLocaleTimeString()}`
             : ''}
         </div>
+        {grants ? <div className="text-[11px] truncate text-[#8a8a8a]" data-testid="company-grants">{grants}</div> : null}
       </div>
       <button onClick={onRefresh} className="text-[11px] px-2 py-0.5 rounded border border-[#3a3a3a] hover:bg-[#2a2a2a]" title="Ask the follower to fetch now">
         refresh
       </button>
     </div>
   );
+}
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/**
+ * describeGrants (CD5): what this device may change, from the follower's copy of the key's own
+ * permissions; null until read. Dates are UTC and locale-free; 7 days or fewer left reads
+ * "expires in N days"; a date that does not parse, or one for a name not granted, is ignored.
+ */
+export function describeGrants(snap: CompanySnapshot, now: number = Date.now()): string | null {
+  if (!Array.isArray(snap.permissions)) return null;
+  const names = snap.permissions.filter((p): p is string => typeof p === 'string' && p !== '' && p !== 'read');
+  if (names.length === 0) return 'This device: read only';
+  const parts = names.map((name) => {
+    const raw = snap.permissions_expire_at?.[name];
+    const t = typeof raw === 'string' ? Date.parse(raw) : NaN;
+    if (!Number.isFinite(t)) return name;
+    const days = Math.ceil((t - now) / 86_400_000);
+    if (days <= 0) return `${name} (expired)`;
+    if (days <= 7) return `${name} (expires in ${days} day${days === 1 ? '' : 's'})`;
+    const d = new Date(t);
+    return `${name} (until ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()})`;
+  });
+  return `This device may: ${parts.join(', ')}`;
 }
 
 export function describeLink(snap: CompanySnapshot): string {
@@ -216,6 +246,8 @@ export function buildRows(snap: CompanySnapshot | null, section: Section): Row[]
         line: `${new Date(a.occurred_at).toLocaleString()}  ${pad(a.action ? `${a.kind}/${a.action}` : a.kind, 22)} ${a.summary}`,
         detail: [a.summary, a.action ? `${a.kind}/${a.action}` : a.kind, ...(a.reference ? [`reference ${a.reference}`] : []), ...(a.status ? [`status ${a.status}`] : [])],
       }));
+    case 'books':
+      return []; // S2.4: painted by CompanyBooksTab, not as rows
   }
 }
 

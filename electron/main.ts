@@ -20,8 +20,12 @@ import {
   releaseInstance,
   spawnNewInstance,
   focusSiblingInstance,
+  isPrimaryAlive,
+  linkInboxDir,
 } from './instanceManager'
-import { checkConnectResult, confirmConnectServer, connectLinksInArgv, parseConnectLink, runConnect } from './companyConnect'
+import { planLinkLaunch, readLinkInbox, writeLinkInbox } from './linkLaunch'
+import { checkConnectResult, confirmConnectServer, connectLinksInArgv, parseConnectLink, runConnect, type ConnectTarget } from './companyConnect'
+import { claimConnectFile, connectFileDirs, findConnectFile, isFirstLaunchForPickup, markPickupDone, pickUpConnectFile, type ConnectFileOutcome } from './connectFile'
 import { defaultWorkspacePath, ensureDefaultWorkspace, planBoot } from './defaultWorkspace'
 
 let mainWindow: BrowserWindow | null = null
@@ -50,6 +54,13 @@ process.on('SIGUSR2', () => {
 // secondary instance this switches to a per-slot Electron profile, so all the
 // managers below (window state, recents, daemon registry) land in the right
 // place. The primary (slot 0) is unchanged from the legacy single-instance app.
+// CD4 + S2.3: off macOS a clicked rysh:// link starts a new process; while the primary runs, hand the link to
+// it (a private inbox it drains) and exit before taking a slot, so a link never starts a second app. Any
+// failure to forward = this launch is the app. (macOS hands links to the running app through open-url.)
+const linkPlan = planLinkLaunch({ argv: process.argv, platform: process.platform, primaryAlive: process.platform !== 'darwin' && isPrimaryAlive() })
+if (linkPlan.kind === 'forward' && writeLinkInbox(linkInboxDir(), linkPlan.links) === linkPlan.links.length) {
+  process.exit(0)
+}
 const instance = allocateInstance()
 
 let sidecarManager: SidecarManager | null = null
@@ -73,6 +84,15 @@ app.on('open-url', (event, url) => {
   pendingConnectLinks.push(url)
   if (appReadyForConnect) void drainConnectLinks()
 })
+// CD4 + S2.3: the primary drains links forwarded by link launches (see linkLaunch.ts).
+if (instance.isPrimary && process.platform !== 'darwin') {
+  const pullInbox = (): void => {
+    for (const l of readLinkInbox(linkInboxDir())) pendingConnectLinks.push(l)
+    if (appReadyForConnect && pendingConnectLinks.length > 0) void drainConnectLinks()
+  }
+  pullInbox()
+  setInterval(pullInbox, 1500).unref()
+}
 
 function sendConnectStatus(stage: 'claiming' | 'opening' | 'done' | 'error', message: string): void {
   mainWindow?.webContents.send('company-connect-status', { stage, message })
@@ -91,6 +111,11 @@ async function handleConnectLink(link: string): Promise<{ success: boolean; erro
     sendConnectStatus('error', error)
     return { success: false, error }
   }
+  return handleConnectTarget(target)
+}
+
+/** handleConnectTarget is the claim itself, shared by links and connect files (S2.3). */
+async function handleConnectTarget(target: ConnectTarget): Promise<{ success: boolean; error?: string }> {
   if (mainWindow) {
     if (mainWindow.isMinimized()) mainWindow.restore()
     mainWindow.focus()
@@ -127,6 +152,47 @@ async function handleConnectLink(link: string): Promise<{ success: boolean; erro
     sendConnectStatus('error', error)
     return { success: false, error }
   }
+}
+
+/** The one question a connect file asks (S2.3); the server confirm in handleConnectTarget still follows for non-rysh.ai servers. */
+async function askConnectFile(message: string, detail: string): Promise<boolean> {
+  const opts = { type: 'question' as const, buttons: ['Cancel', 'Connect'], defaultId: 1, cancelId: 0, message, detail }
+  const { response } = mainWindow ? await dialog.showMessageBox(mainWindow, opts) : await dialog.showMessageBox(opts)
+  return response === 1
+}
+
+/** Connect files already answered in this run (claimed, declined, refused or failed): never asked twice. */
+const answeredConnectFiles = new Set<string>()
+
+/** Shows what became of a connect file; the claim path reports its own progress and errors. */
+function reportConnectFile(out: ConnectFileOutcome): { success: boolean; error?: string } {
+  if (out.kind === 'none') return { success: false }
+  answeredConnectFiles.add(out.path)
+  if (out.kind === 'refused') {
+    const error = `Not using ${basename(out.path)}: ${out.reason}.`
+    sendConnectStatus('error', error)
+    return { success: false, error }
+  }
+  if (out.kind === 'declined') return { success: false, error: 'Cancelled.' }
+  if (out.kind === 'failed') return { success: false, error: out.error }
+  return { success: true }
+}
+
+/** S2.3: the welcome screen's "Choose connect file…": main opens the dialog and reads the file. */
+async function chooseConnectFile(): Promise<{ success: boolean; error?: string }> {
+  const opts = {
+    title: 'Choose a Rysh connect file',
+    properties: ['openFile' as const],
+    filters: [{ name: 'Rysh connect file', extensions: ['ryshconnect'] }],
+  }
+  const picked = mainWindow ? await dialog.showOpenDialog(mainWindow, opts) : await dialog.showOpenDialog(opts)
+  if (picked.canceled || picked.filePaths.length === 0) return { success: false }
+  const out = await claimConnectFile(picked.filePaths[0], {
+    now: Date.now(),
+    ask: askConnectFile,
+    claim: (target) => handleConnectTarget(target),
+  })
+  return reportConnectFile(out)
 }
 
 async function drainConnectLinks(): Promise<void> {
@@ -664,6 +730,15 @@ app.whenReady().then(async () => {
   sidecarManager.setNatsPort(instance.natsPort)
   sidecarManager.setNatsDataDir(instance.natsDataDir)
   workspaceManager = new WorkspaceManager()
+  // S2.3: read before the boot plan may add the default workspace (first-launch connect file pickup).
+  const recentAtStart = workspaceManager.getRecent().length
+  // S2.4: on first launch a fresh connect file counts as a pending link, so the company opens straight
+  // away instead of after a detour through the default workspace.
+  const pickupMarker = join(app.getPath('userData'), 'connect-file-pickup.done')
+  const firstLaunchFile =
+    instance.isPrimary && isFirstLaunchForPickup(pickupMarker, recentAtStart)
+      ? findConnectFile(connectFileDirs(app.getPath('home')), Date.now())
+      : null
 
   // Grant microphone (getUserMedia) access to our own renderer for voice
   // prompting, but only to the main window — not to web-pane BrowserViews that
@@ -711,7 +786,7 @@ app.whenReady().then(async () => {
     lastValid: lastWs != null && workspaceManager.validateWorkspace(lastWs.path),
     recentCount: workspaceManager.getRecent().length,
     isPrimary: instance.isPrimary,
-    pendingConnectLinks: pendingConnectLinks.length,
+    pendingConnectLinks: pendingConnectLinks.length + (firstLaunchFile ? 1 : 0),
   })
   if (lastWs && bootPlan.kind === 'reopen-last') {
     try {
@@ -775,6 +850,7 @@ app.whenReady().then(async () => {
   registerIpcHandlers(sidecarManager, webPaneManager, workspaceManager, {
     onOpenWorkspace: () => showOpenWorkspaceDialog(),
     onConnectCompany: (link: string) => handleConnectLink(link),
+    onConnectCompanyFile: () => chooseConnectFile(),
     onSelectWorkspace: async (path: string) => {
       // An empty path is the "Close Workspace" signal.
       if (!path) return closeWorkspace()
@@ -823,6 +899,19 @@ app.whenReady().then(async () => {
   }
   appReadyForConnect = true
   void drainConnectLinks()
+  // S2.3 (plan v4 R4): on first launch the primary picks up a connect file downloaded from the company page
+  // in the last 30 minutes (Downloads, then Desktop), asks once, claims it, and deletes it only after a good
+  // claim. First launch only: macOS asks the user before an app lists those folders.
+  if (instance.isPrimary && isFirstLaunchForPickup(pickupMarker, recentAtStart)) {
+    markPickupDone(pickupMarker)
+    void pickUpConnectFile({
+      dirs: connectFileDirs(app.getPath('home')),
+      now: Date.now(),
+      ask: askConnectFile,
+      claim: (target) => handleConnectTarget(target),
+      skip: answeredConnectFiles,
+    }).then(reportConnectFile)
+  }
 
   // Set up auto-updater (production only)
   if (!is.dev) {

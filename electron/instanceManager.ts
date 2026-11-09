@@ -85,6 +85,21 @@ function slotLockPath(slot: number): string {
   return join(slotLockDir(), `slot-${slot}.lock`)
 }
 
+/** CD4: is the primary (slot 0) held by a live process? Read-only; never reclaims. */
+export function isPrimaryAlive(): boolean {
+  try {
+    const pid = JSON.parse(readFileSync(slotLockPath(0), 'utf-8')).pid
+    return typeof pid === 'number' && pid !== process.pid && isPidAlive(pid)
+  } catch {
+    return false
+  }
+}
+
+/** CD4: the private inbox a Linux link launch drops its links into for the primary (linkLaunch.ts). */
+export function linkInboxDir(): string {
+  return join(app.getPath('appData'), SHARED_DIR_NAME, 'connect-inbox')
+}
+
 /** The fd of the lockfile we currently hold, so we can release it on quit. */
 let heldLockFd: number | null = null
 let heldLockPath: string | null = null

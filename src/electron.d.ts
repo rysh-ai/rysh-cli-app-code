@@ -72,7 +72,8 @@ interface ElectronAPI {
 
   company: {
     connect: (link: string) => Promise<{ success: boolean; error?: string }>
-    onStatus: (callback: (status: { stage: 'claiming' | 'opening' | 'done' | 'error'; message: string }) => void) => void
+    openFile: () => Promise<{ success: boolean; error?: string }>
+    onStatus: (callback: (status: { stage: 'claiming' | 'opening' | 'done' | 'error'; message: string }) => void) => () => void
     removeStatusListener: () => void
   }
 

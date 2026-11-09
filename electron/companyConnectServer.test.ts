@@ -86,7 +86,7 @@ describe('confirmConnectServer', () => {
 })
 
 describe('connectArgs: the sidecar gets only the server and the one-time code', () => {
-  it('argv is exactly connect <server> <code> --json --device <label>', () => {
+  it('argv is exactly connect <server> <code> --json --device <label> --vehicle desktop (the claim is recorded as the desktop app)', () => {
     expect(connectArgs({ server: 'https://rysh.ai', token: TOKEN }, 'Rysh Desktop on m')).toEqual([
       'connect',
       'https://rysh.ai',
@@ -94,6 +94,8 @@ describe('connectArgs: the sidecar gets only the server and the one-time code', 
       '--json',
       '--device',
       'Rysh Desktop on m',
+      '--vehicle',
+      'desktop',
     ])
   })
 

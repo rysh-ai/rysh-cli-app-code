@@ -70,6 +70,8 @@ export interface PaneSnapshot {
   // Per-pane enabled input modes (rysh-cli ##mode). Source of truth for the
   // mode cycle; empty/absent in pre-field snapshots → default set.
   enabled_modes?: string[];
+  /** N1: a mode the daemon asks an attaching front-end to open on (a company connect: 'company'); applied once. */
+  preferred_mode?: string;
   output: string;
   status: string;
   last_command: string;
@@ -114,6 +116,10 @@ export interface PaneSnapshot {
   controlling_share_id?: string;
   controlling_pane_alias?: string;
   connected_to_pane_id?: string;
+  // The pane's actor missed the daemon's snapshot deadline: this entry is its
+  // last answer (or a placeholder), not the present. Never act on a transition
+  // it shows — see carryStalePanes in store.ts.
+  stale?: boolean;
   raw_mode?: boolean;
   vt_screen?: string[];
   vt_cursor_row?: number;
@@ -610,4 +616,21 @@ export interface CompanySnapshot {
   activity: CompanyActivity[] | null;
   link: CompanyLink;
   fetched_at: string;
+  /** CD5: the key's own grants (GET .../connect/permissions), read by the follower; absent = not read yet, [] = read only. */
+  permissions?: string[];
+  /** CD5: RFC3339 expiry per granted permission (no entry for read). */
+  permissions_expire_at?: Record<string, string>;
+  /** S2.4: the read-only Books data the key may read; absent = an older server or daemon. */
+  books?: CompanyBooks;
+}
+
+/**
+ * S2.4: the server's Books JSON as the daemon passes it through (amounts are
+ * integer pence). Typed loosely on purpose: CompanyBooksTab checks every field.
+ */
+export interface CompanyBooks {
+  enabled: boolean;
+  deadlines?: Record<string, unknown>;
+  summary?: Record<string, unknown>;
+  ledger?: Record<string, unknown>;
 }

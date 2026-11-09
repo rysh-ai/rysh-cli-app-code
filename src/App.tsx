@@ -1,3 +1,4 @@
+import { ConnectStatusToast } from './components/ConnectStatusToast';
 import { useEffect } from 'react';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useKeyboard } from './hooks/useKeyboard';
@@ -80,6 +81,7 @@ export default function App() {
       <ConnectionStatus />
       <ModeOverlay />
       <ApprovalOverlay />
+      <ConnectStatusToast />
       <ContextMenu />
       <ControlDashboard />
     </div>

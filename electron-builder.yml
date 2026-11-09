@@ -59,6 +59,8 @@ mac:
     NSContactsUsageDescription: Rysh lists your contacts so you can choose someone for a FaceTime audio call.
     NSMicrophoneUsageDescription: Rysh uses the microphone for voice prompting (speech-to-text) and in meetings you join in a pane.
     NSCameraUsageDescription: Rysh uses the camera only in meetings you join in a pane (Google Meet, Zoom, Teams or a rysh room).
+    NSDownloadsFolderUsageDescription: On first launch Rysh looks for a company connect file (.ryshconnect) you downloaded from your company page in the last 30 minutes.
+    NSDesktopFolderUsageDescription: On first launch Rysh looks for a company connect file (.ryshconnect) you saved from your company page in the last 30 minutes.
   extraResources:
     # ${arch} is the arch of the artifact being built, so an arm64 dmg carries
     # only rysh-darwin-arm64. Matches resolveBinaryPath() in electron/sidecar.ts.
