@@ -2,6 +2,7 @@ import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdi
 import { randomBytes } from 'crypto'
 import { join } from 'path'
 import { parseConnectLink } from '../src/utils/connectLink'
+import { parseSandboxDesktopLink } from '../src/utils/sandboxDesktopLink'
 
 /**
  * CD4 (design 037 on Linux): macOS hands a rysh:// link to the RUNNING app
@@ -15,13 +16,24 @@ import { parseConnectLink } from '../src/utils/connectLink'
  * credential): the inbox is this user's 0700 directory of 0600 files, created
  * O_EXCL, never read through a symlink, and each file is removed once read.
  */
+/** A link the inbox carries: a connect link, or (rr-order-154 C8, sandboxes flag on) a sandbox desktop link. */
+function isForwardable(link: string, sandboxLinks: boolean): boolean {
+  return parseConnectLink(link) !== null || (sandboxLinks && parseSandboxDesktopLink(link) !== null)
+}
+
 export type LinkLaunchPlan = { kind: 'forward'; links: string[] } | { kind: 'own' }
 
-export function planLinkLaunch(opts: { argv: readonly string[]; platform: NodeJS.Platform; primaryAlive: boolean }): LinkLaunchPlan {
+export function planLinkLaunch(opts: {
+  argv: readonly string[]
+  platform: NodeJS.Platform
+  primaryAlive: boolean
+  /** RYSH_EXPERIMENTAL_SANDBOXES=1: sandbox desktop links are forwarded too. */
+  sandboxLinks?: boolean
+}): LinkLaunchPlan {
   const own: LinkLaunchPlan = { kind: 'own' }
   if (opts.platform === 'darwin' || !opts.primaryAlive) return own
   if (opts.argv.some((a) => a === '--new-instance' || a.startsWith('--instance='))) return own
-  const links = opts.argv.filter((a) => a.toLowerCase().startsWith('rysh://') && parseConnectLink(a) !== null)
+  const links = opts.argv.filter((a) => a.toLowerCase().startsWith('rysh://') && isForwardable(a, opts.sandboxLinks === true))
   return links.length > 0 ? { kind: 'forward', links } : own
 }
 
@@ -53,8 +65,11 @@ export function writeLinkInbox(dir: string, links: readonly string[]): number {
   return n
 }
 
-/** Returns the connect links waiting in the inbox (oldest first) and removes their files; anything else is dropped. */
-export function readLinkInbox(dir: string): string[] {
+/**
+ * Returns the connect links (and, with sandboxLinks, the sandbox desktop links) waiting in the inbox,
+ * oldest first, and removes their files; anything else is dropped.
+ */
+export function readLinkInbox(dir: string, opts: { sandboxLinks?: boolean } = {}): string[] {
   const out: string[] = []
   try {
     if (!privateDir(dir)) return out
@@ -75,7 +90,7 @@ export function readLinkInbox(dir: string): string[] {
           closeSync(fd)
         }
         unlinkSync(p)
-        if (parseConnectLink(text) !== null) out.push(text)
+        if (isForwardable(text, opts.sandboxLinks === true)) out.push(text)
       } catch {
         /* one bad entry never stops the rest */
       }

@@ -118,11 +118,61 @@ describe('wiring (static)', () => {
   it('S2.3: every argv-link platform (not macOS) checks the primary and forwards; only the primary reads the inbox', () => {
     expect(main).toMatch(/primaryAlive: process\.platform !== 'darwin' && isPrimaryAlive\(\)/)
     expect(main).toMatch(/instance\.isPrimary && process\.platform !== 'darwin'/)
-    expect(main).toMatch(/for \(const l of readLinkInbox\(linkInboxDir\(\)\)\) pendingConnectLinks\.push\(l\)/)
+    // rr-order-154 C8 (boat-web): one read of the inbox; sandbox desktop links go to the sandbox window,
+    // everything else (connect links) to the connect queue as before.
+    expect(main).toMatch(/for \(const l of readLinkInbox\(linkInboxDir\(\), \{ sandboxLinks: sandboxLinkLaunch \}\)\) \{\n\s+if \(isSandboxDesktopLinkArg\(l\)\) void app\.whenReady\(\)\.then\(\(\) => handleSandboxDesktopLink\(l\)\)\n\s+else pendingConnectLinks\.push\(l\)/)
   })
   it('instanceManager exports isPrimaryAlive() and linkInboxDir() under the shared dir', () => {
     expect(im).toMatch(/export function isPrimaryAlive\(\): boolean/)
     expect(im).toMatch(/export function linkInboxDir\(\): string/)
     expect(im).toMatch(/join\(app\.getPath\('appData'\), SHARED_DIR_NAME, 'connect-inbox'\)/)
+  })
+})
+
+// rr-order-154 C8 (boat-web): a rysh://sandbox-desktop link follows the same S2.3 rule (a link never
+// starts a second app) — but only with RYSH_EXPERIMENTAL_SANDBOXES=1. With the flag off nothing
+// changes: the launch plan and the inbox ignore sandbox links exactly as before.
+describe('sandbox desktop links (rr-order-154 C8, dark)', () => {
+  const base = { platform: 'linux' as NodeJS.Platform, primaryAlive: true }
+  const SBX = 'rysh://sandbox-desktop?server=https%3A%2F%2Frysh.ai&workspace=ws_1&sandbox=sbx_1&mode=watch'
+  it('flag on: a sandbox desktop link is forwarded to the running app', () => {
+    expect(planLinkLaunch({ ...base, sandboxLinks: true, argv: ['x', '--', SBX] })).toEqual({ kind: 'forward', links: [SBX] })
+  })
+  it('flag off (or not given): a sandbox desktop link is not forwarded, as before', () => {
+    expect(planLinkLaunch({ ...base, sandboxLinks: false, argv: ['x', '--', SBX] }).kind).toBe('own')
+    expect(planLinkLaunch({ ...base, argv: ['x', '--', SBX] }).kind).toBe('own')
+  })
+  it('flag on: a sandbox link that carries a ticket or token is never forwarded', () => {
+    expect(planLinkLaunch({ ...base, sandboxLinks: true, argv: ['x', '--', SBX + '&ticket=abc'] }).kind).toBe('own')
+    expect(planLinkLaunch({ ...base, sandboxLinks: true, argv: ['x', '--', SBX + '&token=abc'] }).kind).toBe('own')
+  })
+  it('flag on: connect and sandbox links together are forwarded in argv order; macOS still owns', () => {
+    expect(planLinkLaunch({ ...base, sandboxLinks: true, argv: ['x', '--', SBX, LINK] })).toEqual({ kind: 'forward', links: [SBX, LINK] })
+    expect(planLinkLaunch({ ...base, platform: 'darwin', sandboxLinks: true, argv: ['x', SBX] }).kind).toBe('own')
+  })
+  it('inbox, flag on: a sandbox link is returned (and its file removed) next to connect links', () => {
+    const inbox = join(scratch(), 'connect-inbox')
+    expect(writeLinkInbox(inbox, [SBX, LINK])).toBe(2)
+    expect(readLinkInbox(inbox, { sandboxLinks: true }).sort()).toEqual([LINK, SBX].sort())
+    expect(readdirSync(inbox)).toHaveLength(0)
+  })
+  it('inbox, flag off: a sandbox link is dropped unread, as any non-connect link', () => {
+    const inbox = join(scratch(), 'connect-inbox')
+    expect(writeLinkInbox(inbox, [SBX])).toBe(1)
+    expect(readLinkInbox(inbox)).toEqual([])
+    expect(readdirSync(inbox)).toHaveLength(0)
+  })
+  it('inbox, flag on: a sandbox link with a credential param is dropped', () => {
+    const inbox = join(scratch(), 'connect-inbox')
+    expect(writeLinkInbox(inbox, [SBX + '&key=abc'])).toBe(1)
+    expect(readLinkInbox(inbox, { sandboxLinks: true })).toEqual([])
+  })
+  it('wiring (static): main.ts reads the flag once and passes it to the launch plan', () => {
+    const main = readFileSync(resolve(__dirname, 'main.ts'), 'utf8')
+    const flag = main.indexOf('const sandboxLinkLaunch = sandboxesEnabled(process.env)')
+    const plan = main.indexOf('planLinkLaunch(')
+    expect(flag).toBeGreaterThan(0)
+    expect(plan).toBeGreaterThan(flag)
+    expect(main).toMatch(/primaryAlive: process\.platform !== 'darwin' && isPrimaryAlive\(\), sandboxLinks: sandboxLinkLaunch \}\)/)
   })
 })

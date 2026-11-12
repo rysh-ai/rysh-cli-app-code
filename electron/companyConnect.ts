@@ -3,6 +3,7 @@ import { lstatSync, readFileSync } from 'fs'
 import { hostname } from 'os'
 import { join, relative, resolve, isAbsolute } from 'path'
 import { parseConnectLink, type ConnectTarget } from '../src/utils/connectLink'
+import { isSandboxDesktopLinkArg } from '../src/utils/sandboxDesktopLink'
 
 /**
  * Company Connect (design 037) — the desktop half of the hand-off.
@@ -273,5 +274,6 @@ export function withoutSessionEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 
 /** The rysh:// links in a launch's argv (Linux/Windows deliver them there). */
 export function connectLinksInArgv(argv: string[]): string[] {
-  return argv.filter((a) => a.toLowerCase().startsWith('rysh://'))
+  // rr-order-154 C8: sandbox desktop links have their own handler (electron/sandboxDesktop.ts).
+  return argv.filter((a) => a.toLowerCase().startsWith('rysh://') && !isSandboxDesktopLinkArg(a))
 }

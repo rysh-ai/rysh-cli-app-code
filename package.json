@@ -1,6 +1,6 @@
 {
   "name": "rysh-cli-app",
-  "version": "0.2.16",
+  "version": "0.2.17",
   "private": true,
   "description": "Rysh Desktop — Agentic terminal multiplexer with embedded web panes",
   "homepage": "https://rysh.ai",

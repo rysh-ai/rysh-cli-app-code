@@ -26,6 +26,8 @@ import {
 import { planLinkLaunch, readLinkInbox, writeLinkInbox } from './linkLaunch'
 import { checkConnectResult, confirmConnectServer, connectLinksInArgv, parseConnectLink, runConnect, type ConnectTarget } from './companyConnect'
 import { claimConnectFile, connectFileDirs, findConnectFile, isFirstLaunchForPickup, markPickupDone, pickUpConnectFile, type ConnectFileOutcome } from './connectFile'
+import { openSandboxDesktop, sandboxDesktopLinksInArgv, sandboxesEnabled } from './sandboxDesktop'
+import { isSandboxDesktopLinkArg } from '../src/utils/sandboxDesktopLink'
 import { defaultWorkspacePath, ensureDefaultWorkspace, planBoot } from './defaultWorkspace'
 
 let mainWindow: BrowserWindow | null = null
@@ -57,7 +59,9 @@ process.on('SIGUSR2', () => {
 // CD4 + S2.3: off macOS a clicked rysh:// link starts a new process; while the primary runs, hand the link to
 // it (a private inbox it drains) and exit before taking a slot, so a link never starts a second app. Any
 // failure to forward = this launch is the app. (macOS hands links to the running app through open-url.)
-const linkPlan = planLinkLaunch({ argv: process.argv, platform: process.platform, primaryAlive: process.platform !== 'darwin' && isPrimaryAlive() })
+// rr-order-154 C8: with RYSH_EXPERIMENTAL_SANDBOXES=1, sandbox desktop links follow the same rule.
+const sandboxLinkLaunch = sandboxesEnabled(process.env)
+const linkPlan = planLinkLaunch({ argv: process.argv, platform: process.platform, primaryAlive: process.platform !== 'darwin' && isPrimaryAlive(), sandboxLinks: sandboxLinkLaunch })
 if (linkPlan.kind === 'forward' && writeLinkInbox(linkInboxDir(), linkPlan.links) === linkPlan.links.length) {
   process.exit(0)
 }
@@ -81,17 +85,45 @@ const pendingConnectLinks: string[] = connectLinksInArgv(process.argv)
 let appReadyForConnect = false
 app.on('open-url', (event, url) => {
   event.preventDefault()
+  // rr-order-154 C8 (dark): a sandbox desktop link opens the rysh.ai viewer in its own
+  // locked-down window; it never reaches the connect queue.
+  if (isSandboxDesktopLinkArg(url)) {
+    void app.whenReady().then(() => handleSandboxDesktopLink(url))
+    return
+  }
   pendingConnectLinks.push(url)
   if (appReadyForConnect) void drainConnectLinks()
 })
 // CD4 + S2.3: the primary drains links forwarded by link launches (see linkLaunch.ts).
 if (instance.isPrimary && process.platform !== 'darwin') {
   const pullInbox = (): void => {
-    for (const l of readLinkInbox(linkInboxDir())) pendingConnectLinks.push(l)
+    for (const l of readLinkInbox(linkInboxDir(), { sandboxLinks: sandboxLinkLaunch })) {
+      if (isSandboxDesktopLinkArg(l)) void app.whenReady().then(() => handleSandboxDesktopLink(l))
+      else pendingConnectLinks.push(l)
+    }
     if (appReadyForConnect && pendingConnectLinks.length > 0) void drainConnectLinks()
   }
   pullInbox()
   setInterval(pullInbox, 1500).unref()
+}
+
+// Linux passes a cold-start link in argv (connectLinksInArgv leaves sandbox links out).
+void app.whenReady().then(() => {
+  for (const l of sandboxDesktopLinksInArgv(process.argv)) void handleSandboxDesktopLink(l)
+})
+
+/** rr-order-154 C8: open a sandbox's desktop; with RYSH_EXPERIMENTAL_SANDBOXES off, nothing happens. */
+async function handleSandboxDesktopLink(link: string): Promise<void> {
+  if (!sandboxesEnabled(process.env)) return
+  const result = await openSandboxDesktop(link, {
+    env: process.env,
+    BrowserWindow,
+    openExternal: (u) => void shell.openExternal(u),
+  })
+  if (!result.ok) {
+    const opts = { type: 'warning' as const, message: 'Could not open the sandbox desktop', detail: result.error }
+    void (mainWindow ? dialog.showMessageBox(mainWindow, opts) : dialog.showMessageBox(opts))
+  }
 }
 
 function sendConnectStatus(stage: 'claiming' | 'opening' | 'done' | 'error', message: string): void {
